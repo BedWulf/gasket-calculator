@@ -12,14 +12,14 @@ from dataclasses import asdict
 from pathlib import Path
 
 from PyQt6.QtCore import QPointF, Qt, QTimer
-from PyQt6.QtGui import QColor, QBrush, QPen, QPainter, QPainterPath
+from PyQt6.QtGui import QColor, QBrush, QPen, QPainter, QPainterPath, QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem,
     QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
-    QHeaderView, QScrollArea, QGridLayout,
+    QHeaderView, QScrollArea, QGridLayout, QFrame,
 )
 from shapely.affinity import translate
 
@@ -312,7 +312,14 @@ class OrderSheetDialog(QDialog):
     def __init__(self, parent=None, initial_parts: list[Part] | None = None):
         super().__init__(parent)
         self.setWindowTitle("Заказной лист — смешанный раскрой")
-        self.resize(1300, 780)
+        # Do not open a window taller than the available desktop on scaled screens.
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            work_area = screen.availableGeometry()
+            self.resize(min(1300, max(700, work_area.width() - 24)),
+                        min(780, max(500, work_area.height() - 32)))
+        else:
+            self.resize(1300, 780)
         self.parts: list[Part] = list(initial_parts or [])
         self.result: NestResult | None = None
         self.variants: list[NestResult] = []
@@ -334,11 +341,23 @@ class OrderSheetDialog(QDialog):
         top.addWidget(intro)
         split = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(split, stretch=1)
+        # Input controls may be taller than the monitor (especially with
+        # Windows text scaling). Scroll them independently of the drawing.
+        self.left_scroll = QScrollArea()
+        self.left_scroll.setObjectName("orderInputScroll")
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.left_scroll.setMinimumWidth(365)
+        self.left_scroll.setMaximumWidth(570)
+        self.left_scroll.setMinimumHeight(200)
         left = QWidget()
-        left.setMinimumWidth(370)
-        left.setMaximumWidth(560)
-        split.addWidget(left)
+        left.setObjectName("orderInputContent")
         l = QVBoxLayout(left)
+        l.setContentsMargins(5, 5, 9, 5)
+        l.setSpacing(8)
+        self.left_scroll.setWidget(left)
+        split.addWidget(self.left_scroll)
         settings = QGroupBox("Заказываемый материал")
         f = QFormLayout(settings)
         self.sheet_width = _spin(1000, 1)
@@ -401,7 +420,10 @@ class OrderSheetDialog(QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.cellDoubleClicked.connect(lambda row, _: self.edit_part(row))
-        l.addWidget(self.table, stretch=1)
+        # The list has its own scroll bar; keep actions below it reachable.
+        self.table.setMinimumHeight(155)
+        self.table.setMaximumHeight(225)
+        l.addWidget(self.table)
         p_row = QHBoxLayout()
         for label, callback in (("Изменить",self.edit_part), ("Удалить",self.remove_part)):
             b = QPushButton(label)
@@ -441,10 +463,8 @@ class OrderSheetDialog(QDialog):
         self.compare_button.setEnabled(False)
         self.compare_button.clicked.connect(self.compare_variants)
         l.addWidget(self.compare_button)
-        self.summary = QLabel("Укажите ширину и количество деталей. Длина вычисляется автоматически. Все размеры — в мм.")
-        self.summary.setWordWrap(True)
-        self.summary.setMinimumHeight(110)
-        l.addWidget(self.summary)
+        # Results are deliberately outside the left input scroller.
+        # They remain visible while the operator edits a long parts list.
         r = QWidget()
         split.addWidget(r)
         right = QVBoxLayout(r)
@@ -452,8 +472,30 @@ class OrderSheetDialog(QDialog):
         self.view = SheetView(self.scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.view.setBackgroundBrush(QColor("#e6e8eb"))
-        self.view.setMinimumSize(400, 360)
+        self.view.setMinimumSize(300, 190)
         right.addWidget(self.view, stretch=1)
+
+        results_box = QGroupBox("Результат расчёта и рекомендуемая длина листа")
+        results_layout = QVBoxLayout(results_box)
+        results_layout.setContentsMargins(6, 6, 6, 6)
+        self.summary_scroll = QScrollArea()
+        self.summary_scroll.setObjectName("orderResultScroll")
+        self.summary_scroll.setWidgetResizable(True)
+        self.summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.summary_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.summary_scroll.setMinimumHeight(108)
+        self.summary_scroll.setMaximumHeight(185)
+        self.summary = QLabel(
+            "Укажите ширину и количество деталей. Длина вычисляется автоматически. "
+            "Все размеры — в мм.")
+        self.summary.setObjectName("orderResultText")
+        self.summary.setWordWrap(True)
+        self.summary.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.summary.setContentsMargins(8, 6, 8, 6)
+        self.summary_scroll.setWidget(self.summary)
+        results_layout.addWidget(self.summary_scroll)
+        right.addWidget(results_box)
         hint = QLabel("Колёсико — масштаб • ЛКМ по детали — перемещение • Ctrl+S — сохранение проекта. "+
                       "Красивый чертёж не заменяет технологическую проверку реза.")
         hint.setWordWrap(True)
@@ -468,7 +510,8 @@ class OrderSheetDialog(QDialog):
             b.clicked.connect(slot)
             buttons.addWidget(b)
         right.addLayout(buttons)
-        split.setSizes([490, 850])
+        split.setChildrenCollapsible(False)
+        split.setSizes([475, 825])
         # После изменения входных параметров прежний раскрой неактуален.
         for spin in (self.sheet_width, self.gap, self.margin, self.step,
                      self.thickness, self.density, self.kerf):
