@@ -2,6 +2,8 @@
 main_window.py — Главное окно приложения (полная версия с ценой, зазором и поворотом).
 """
 
+import math
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QRadioButton, QButtonGroup,
@@ -13,7 +15,7 @@ from PyQt6.QtGui import QFont, QAction
 
 from config import Theme, PALETTES, APP_TITLE, APP_WIDTH, APP_HEIGHT
 from models import Gasket, GasketShape, Sheet
-from algorithms import PackingAlgorithm
+from algorithms import PackingAlgorithm, WasteCalculator
 from storage.sheet_repository import SheetRepository
 
 from ui.canvas import GasketCanvas
@@ -206,6 +208,9 @@ class MainWindow(QMainWindow):
 
         self.sheet_tabs = QTabWidget()
         self._refresh_tabs()
+        self.sheet_tabs.currentChanged.connect(self._on_sheet_changed)
+        self.sheet_tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sheet_tabs.customContextMenuRequested.connect(self._on_tab_context_menu)
         layout.addWidget(self.sheet_tabs, stretch=1)
 
         btn_container = QWidget()
@@ -238,8 +243,10 @@ class MainWindow(QMainWindow):
             tab = QWidget()
             self.sheet_tabs.addTab(tab, sheet.name)
 
-        self.sheet_tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.sheet_tabs.customContextMenuRequested.connect(self._on_tab_context_menu)
+    def _on_sheet_changed(self, index: int):
+        # Показываем расчёт именно для активной вкладки, а не предыдущего листа.
+        if index >= 0 and self.current_layout is not None:
+            self._on_calculate()
 
     def _on_tab_context_menu(self, position):
         index = self.sheet_tabs.tabBar().tabAt(position)
@@ -314,12 +321,14 @@ class MainWindow(QMainWindow):
         shape_layout.addWidget(self.radio_circle)
         layout.addLayout(shape_layout)
 
-        layout.addWidget(QLabel("Длина (мм):"))
+        self.label_length = QLabel("Длина (мм):")
+        layout.addWidget(self.label_length)
         self.input_length = QLineEdit()
         self.input_length.setPlaceholderText("150")
         layout.addWidget(self.input_length)
 
-        layout.addWidget(QLabel("Ширина (мм):"))
+        self.label_width = QLabel("Ширина (мм):")
+        layout.addWidget(self.label_width)
         self.input_width = QLineEdit()
         self.input_width.setPlaceholderText("100")
         layout.addWidget(self.input_width)
@@ -368,7 +377,7 @@ class MainWindow(QMainWindow):
         self.btn_rotate_gasket.setFixedHeight(36)
         self.btn_rotate_gasket.setFont(QFont("Segoe UI", 11))
         self.btn_rotate_gasket.clicked.connect(self._on_rotate_gasket)
-        self.btn_rotate_gasket.hide()
+        self.btn_rotate_gasket.setVisible(True)
         layout.addWidget(self.btn_rotate_gasket)
 
         # Кнопка подбора листа
@@ -378,6 +387,14 @@ class MainWindow(QMainWindow):
         self.btn_fit_sheet.clicked.connect(self._on_fit_sheet)
         layout.addWidget(self.btn_fit_sheet)
 
+        # Отдельный рабочий режим: фиксированная ширина заказного листа,
+        # смешанные типоразмеры и сложные контуры. Не влияет на старый расчёт.
+        self.btn_order_sheet = QPushButton("📐 Заказной лист — подобрать длину")
+        self.btn_order_sheet.setFixedHeight(44)
+        self.btn_order_sheet.setToolTip("Быстрый ввод простых форм, редактор сложных деталей, автоматический поиск длины и раскроя")
+        self.btn_order_sheet.clicked.connect(self._open_order_sheet)
+        layout.addWidget(self.btn_order_sheet)
+
         # Панель статистики (под кнопкой расчёта)
         self.stats_panel = StatsPanel(theme=self.theme)
         layout.addWidget(self.stats_panel)
@@ -386,18 +403,18 @@ class MainWindow(QMainWindow):
         return panel
 
     def _on_shape_changed(self, is_rect: bool):
-        if is_rect:
-            self.input_length.show()
-            self.input_width.show()
-            self.label_diameter.hide()
-            self.input_diameter.hide()
-            self.btn_rotate_gasket.show()
-        else:
-            self.input_length.hide()
-            self.input_width.hide()
-            self.label_diameter.show()
-            self.input_diameter.show()
-            self.btn_rotate_gasket.hide()
+        self.label_length.setVisible(is_rect)
+        self.input_length.setVisible(is_rect)
+        self.label_width.setVisible(is_rect)
+        self.input_width.setVisible(is_rect)
+        self.label_diameter.setVisible(not is_rect)
+        self.input_diameter.setVisible(not is_rect)
+        self.btn_rotate_gasket.setVisible(is_rect)
+        # Предыдущая раскладка относится к другой форме прокладок.
+        self.layout_normal = self.layout_rotated = self.current_layout = None
+        self.stats_panel.hide()
+        self.canvas.layout = None
+        self.canvas.update()
 
     def _on_calculate(self):
         """Основной расчёт — считаем оба варианта, показываем лучший."""
@@ -405,10 +422,12 @@ class MainWindow(QMainWindow):
         if not gasket:
             return
 
-        gap = self._safe_float(self.input_gap.text()) or 0.0
-        quantity = int(self._safe_float(self.input_quantity.text()) or 0)
-        sheet_price = self._safe_float(self.input_price.text()) or 0.0
-        
+        gap = self._read_nonnegative(self.input_gap.text(), "Зазор")
+        quantity = self._read_quantity()
+        sheet_price = self._read_nonnegative(self.input_price.text(), "Цена листа")
+        if gap is None or quantity is None or sheet_price is None:
+            return
+
         self.current_quantity = quantity
 
         sheet = self._get_current_sheet()
@@ -439,13 +458,15 @@ class MainWindow(QMainWindow):
             return
         
         # Переключаем
-        if self.current_layout == self.layout_normal:
+        if self.current_layout is self.layout_normal:
             self.current_layout = self.layout_rotated
         else:
             self.current_layout = self.layout_normal
         
         # Пересчитываем цену для отображаемого варианта
-        sheet_price = self._safe_float(self.input_price.text()) or 0.0
+        sheet_price = self._read_nonnegative(self.input_price.text(), "Цена листа")
+        if sheet_price is None:
+            return
         waste_price = 0.0
         if sheet_price > 0 and self.current_layout.sheet.area > 0:
             waste_price = (self.current_layout.waste_area / self.current_layout.sheet.area) * sheet_price
@@ -471,9 +492,12 @@ class MainWindow(QMainWindow):
         if not gasket:
             return
 
-        gap = self._safe_float(self.input_gap.text()) or 0.0
-        quantity = int(self._safe_float(self.input_quantity.text()) or 0)
-        
+        gap = self._read_nonnegative(self.input_gap.text(), "Зазор")
+        quantity = self._read_quantity()
+        sheet_price = self._read_nonnegative(self.input_price.text(), "Цена листа")
+        if gap is None or quantity is None or sheet_price is None:
+            return
+
         if quantity <= 0:
             QMessageBox.information(self, "Внимание",
                 "Для подбора листа укажите количество деталей в поле «Количество».")
@@ -489,7 +513,7 @@ class MainWindow(QMainWindow):
             if layout.total_gaskets == 0:
                 continue
             layout.calculate_sheets_needed(quantity)
-            total_waste = layout.waste_area * layout.sheets_needed
+            total_waste = WasteCalculator.calculate_total_waste(layout, quantity)
             
             if layout.sheets_needed < best_sheets_needed:
                 best_sheets_needed = layout.sheets_needed
@@ -507,14 +531,22 @@ class MainWindow(QMainWindow):
             return
 
         for i, sheet in enumerate(self.sheets):
-            if sheet.name == best_sheet.name:
-                self.sheet_tabs.setCurrentIndex(i)
+            if sheet is best_sheet:
+                # Расчёт здесь уже сделан; избегаем промежуточного пересчёта от сигнала вкладки.
+                self.sheet_tabs.blockSignals(True)
+                try:
+                    self.sheet_tabs.setCurrentIndex(i)
+                finally:
+                    self.sheet_tabs.blockSignals(False)
                 break
 
-        self.current_layout = best_layout
+        self.layout_normal, self.layout_rotated = PackingAlgorithm.pack_both_orientations(
+            best_sheet, gasket, gap
+        )
+        self.current_layout = (self.layout_rotated if best_layout.is_rotated
+                               else self.layout_normal)
         self.current_quantity = quantity
-        
-        sheet_price = self._safe_float(self.input_price.text()) or 0.0
+
         waste_price = (best_layout.waste_area / best_layout.sheet.area) * sheet_price if sheet_price > 0 else 0.0
         
         self._display_current_layout(waste_price)
@@ -524,6 +556,12 @@ class MainWindow(QMainWindow):
             f"Деталей на листе: {best_layout.total_gaskets}\n"
             f"Нужно листов: {best_layout.sheets_needed}\n"
             f"Общие отходы: {int(best_waste)} мм²")
+
+    def _open_order_sheet(self):
+        """Самостоятельный модуль смешанного раскроя; основное окно не изменяем."""
+        from ui.order_sheet_dialog import OrderSheetDialog
+        dialog = OrderSheetDialog(parent=self)
+        dialog.exec()
 
     def _read_gasket(self):
         """Считывает размеры прокладки из полей ввода."""
@@ -551,10 +589,35 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _safe_float(text: str):
         try:
-            value = float(text.replace(",", "."))
-            return value if value > 0 else None
+            value = float(text.replace(",", ".").strip())
+            return value if math.isfinite(value) and value > 0 else None
         except (ValueError, AttributeError):
             return None
+
+    def _read_nonnegative(self, text: str, name: str):
+        if not text.strip():
+            return 0.0
+        try:
+            value = float(text.strip().replace(",", "."))
+            if math.isfinite(value) and value >= 0:
+                return value
+        except ValueError:
+            pass
+        QMessageBox.warning(self, "Ошибка ввода", f"{name}: введите число не меньше нуля.")
+        return None
+
+    def _read_quantity(self):
+        text = self.input_quantity.text().strip()
+        if not text:
+            return 0
+        try:
+            value = float(text.replace(",", "."))
+            if math.isfinite(value) and value >= 0 and value.is_integer():
+                return int(value)
+        except ValueError:
+            pass
+        QMessageBox.warning(self, "Ошибка ввода", "Количество должно быть целым неотрицательным числом.")
+        return None
 
     def _apply_stylesheet(self):
         c = self.colors

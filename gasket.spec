@@ -1,12 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_all
+
+# GEOS + вспомогательные модули ezdxf для импорта и раскроя.
+shapely_datas, shapely_bins, shapely_hidden = collect_all('shapely')
+ezdxf_datas, ezdxf_bins, ezdxf_hidden = collect_all('ezdxf')
 block_cipher = None
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[
+    binaries=shapely_bins + ezdxf_bins,
+    datas=shapely_datas + ezdxf_datas + [
         ('assets/app_icon.png', 'assets'),
         ('config.py', '.'),
     ],
@@ -15,7 +20,7 @@ a = Analysis(
         'PyQt6.QtWidgets',
         'PyQt6.QtCore',
         'PyQt6.QtGui',
-    ],
+    ] + shapely_hidden + ezdxf_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -50,3 +55,5 @@ exe = EXE(
     entitlements_file=None,
     icon='assets/app_icon.png',  # Иконка
 )
+# При сборке на Windows проверьте на чистой машине наличие GEOS/Shapely,
+# используемых только в новом режиме смешанного раскроя.
