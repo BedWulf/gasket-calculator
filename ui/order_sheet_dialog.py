@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from algorithms.project_io import result_from_dict
 from algorithms.import_cad import import_svg, import_dxf
 from ui.contour_editor import ContourEditor
 from algorithms.nesting import (
-    Part, Placement, NestResult, calculate_sheet, oriented_geometry, validate_result,
+    Part, Placement, NestResult, calculate_variants, oriented_geometry, validate_result,
 )
 
 SHAPE_NAMES = {
@@ -246,6 +247,9 @@ class OrderSheetDialog(QDialog):
         self.resize(1300, 780)
         self.parts: list[Part] = list(initial_parts or [])
         self.result: NestResult | None = None
+        self.variants: list[NestResult] = []
+        self._variant_index = -1
+        self._updating_variants = False
         self.items: list[DragPartItem] = []
         self._loading_scene = False
         self._build_ui()
@@ -338,6 +342,15 @@ class OrderSheetDialog(QDialog):
         self.calculate_button.setMinimumHeight(44)
         self.calculate_button.clicked.connect(self.calculate)
         l.addWidget(self.calculate_button)
+        variant_row = QHBoxLayout()
+        variant_row.addWidget(QLabel("Вариант раскроя:"))
+        self.variant_combo = QComboBox()
+        self.variant_combo.setEnabled(False)
+        self.variant_combo.setToolTip(
+            "Сравните варианты по длине и отходам; выбор меняет чертёж и спецификацию.")
+        self.variant_combo.currentIndexChanged.connect(self._select_variant)
+        variant_row.addWidget(self.variant_combo, stretch=1)
+        l.addLayout(variant_row)
         self.summary = QLabel("Укажите ширину и количество деталей. Длина вычисляется автоматически. Все размеры — в мм.")
         self.summary.setWordWrap(True)
         self.summary.setMinimumHeight(110)
@@ -481,6 +494,12 @@ class OrderSheetDialog(QDialog):
 
     def _reset_layout(self):
         self.result = None
+        self.variants = []
+        self._variant_index = -1
+        self._updating_variants = True
+        self.variant_combo.clear()
+        self.variant_combo.setEnabled(False)
+        self._updating_variants = False
         self.scene.clear()
         self.items = []
         self.summary.setText("Данные изменены. Нажмите «Подобрать длину листа автоматически».")
@@ -548,18 +567,54 @@ class OrderSheetDialog(QDialog):
         except (OSError,ValueError) as exc:
             QMessageBox.warning(self,'Невозможно импортировать',str(exc))
 
+    @staticmethod
+    def _variant_label(index: int, result: NestResult) -> str:
+        """Информация для сравнения без выдачи эвристики за оптимум."""
+        return (f"{index + 1}. {result.sheet_width:g} × {result.sheet_length:g} мм · "
+                f"отходы {result.waste_area / 1e6:.4f} м² · "
+                f"исп. {result.utilization:.1f}%")
+
+    def _set_variants(self, candidates: list[NestResult], *, loaded: bool = False):
+        """Смену списка синхронизируем с Qt без промежуточного переключения."""
+        self._updating_variants = True
+        self.variants = candidates
+        self._variant_index = 0 if candidates else -1
+        self.variant_combo.clear()
+        for i, candidate in enumerate(candidates):
+            label = self._variant_label(i, candidate)
+            self.variant_combo.addItem(("Загружено · " if loaded else "") + label)
+        self.variant_combo.setEnabled(len(candidates) > 1)
+        self.variant_combo.setCurrentIndex(self._variant_index)
+        self._updating_variants = False
+        self.result = deepcopy(candidates[0]) if candidates else None
+        if self.result:
+            self._draw_scene()
+
+    def _select_variant(self, index: int):
+        if self._updating_variants or index < 0 or index >= len(self.variants):
+            return
+        if self.result is not None and 0 <= self._variant_index < len(self.variants):
+            # Пользователь мог передвинуть детали вручную. Его исправленная
+            # раскладка остаётся доступной при переключении туда и обратно.
+            self.variants[self._variant_index] = deepcopy(self.result)
+        self._variant_index = index
+        self.result = deepcopy(self.variants[index])
+        self._draw_scene()
+
     def calculate(self):
         try:
-            self.result = calculate_sheet(self.parts, self.sheet_width.value(),
-                                          self.gap.value(), self.margin.value(), self.step.value(),
-                                          quality=self.quality.currentData())
-            self.result.material_name = self.material_name.text().strip()
-            self.result.thickness_mm = self.thickness.value()
-            self.result.density_g_cm3 = self.density.value()
+            candidates = calculate_variants(
+                self.parts, self.sheet_width.value(), self.gap.value(),
+                self.margin.value(), self.step.value(),
+                quality=self.quality.currentData(), max_variants=6)
+            for candidate in candidates:
+                candidate.material_name = self.material_name.text().strip()
+                candidate.thickness_mm = self.thickness.value()
+                candidate.density_g_cm3 = self.density.value()
         except (ValueError, RuntimeError) as e:
             QMessageBox.warning(self, "Не удалось рассчитать", str(e))
             return
-        self._draw_scene()
+        self._set_variants(candidates)
 
     def _draw_scene(self):
         if not self.result:
@@ -670,9 +725,8 @@ class OrderSheetDialog(QDialog):
             self.material_details_toggle.setChecked(bool(result.material_name or
                 result.thickness_mm or result.density_g_cm3))
             self.parts = parts
-            self.result = result
             self._refresh_table()
-            self._draw_scene()
+            self._set_variants([result], loaded=True)
         except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
             QMessageBox.warning(self,"Не удалось открыть",str(exc))
 

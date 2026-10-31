@@ -439,11 +439,19 @@ def _attempt(parts: list[Part], order: list[int], width: float,
     return result
 
 
-def calculate_sheet(parts: list[Part], sheet_width: float,
+def calculate_variants(parts: list[Part], sheet_width: float,
                     gap: float = 0.0, margin: float = 0.0,
                     length_step: float = 1.0,
-                    quality: str = "standard") -> NestResult:
-    """Подобрать длину листа при фиксированной ширине.
+                    quality: str = "standard",
+                    max_variants: int = 6) -> list[NestResult]:
+    """Подобрать и вернуть несколько РАЗНЫХ корректных раскладок листа.
+
+    Отсортированы по длине заказного листа; расход материала для одной
+    ширины и набора деталей однозначно определяется этой длиной.
+    Равные по длине варианты могут отличаться положением и поворотом деталей.
+    Каждый вариант независимо проходит проверку геометрии.
+
+    Подобрать длину листа при фиксированной ширине.
 
     Пытаемся несколько порядков укладки и выбираем самый короткий корректный.
     `length_step` позволяет заказать длину с нужной кратностью (например, 10 мм).
@@ -453,6 +461,8 @@ def calculate_sheet(parts: list[Part], sheet_width: float,
     Результат не хуже standard, поскольку
     его варианты включены в рассмотрение. Это всё ещё эвристика.
     """
+    if type(max_variants) is not int or not 1 <= max_variants <= 20:
+        raise ValueError("Количество вариантов должно быть от 1 до 20")
     if quality not in ("standard", "thorough"):
         raise ValueError("Неизвестный режим качества раскроя")
     if not all(isfinite(v) for v in (sheet_width, gap, margin, length_step)):
@@ -509,4 +519,33 @@ def calculate_sheet(parts: list[Part], sheet_width: float,
                 continue
     if not results:
         raise ValueError("Не удаётся разместить детали на листе заданной ширины (включая возможный поворот)")
-    return min(results, key=lambda r: (r.sheet_length, r.waste_area))
+    # Убираем повторяющиеся варианты независимо от порядка экземпляров
+    # одинакового типоразмера. Длина и все координаты учитываются в ключе.
+    # Стабильная сортировка сохраняет приоритет первого найденного решения.
+    unique: list[NestResult] = []
+    seen = set()
+    for result in sorted(results, key=lambda r: (r.sheet_length, r.waste_area)):
+        key = (round(result.sheet_length, 6), tuple(sorted(
+            (p.part_index, round(p.x, 4), round(p.y, 4), p.angle % 360)
+            for p in result.placements)))
+        if key not in seen:
+            if not validate_result(result):
+                raise RuntimeError("Некорректная альтернативная раскладка")
+            seen.add(key)
+            unique.append(result)
+            if len(unique) == max_variants:
+                break
+    return unique
+
+
+def calculate_sheet(parts: list[Part], sheet_width: float,
+                    gap: float = 0.0, margin: float = 0.0,
+                    length_step: float = 1.0,
+                    quality: str = "standard") -> NestResult:
+    """Обратная совместимость: лучший из доступных вариантов раскроя.
+
+    Для просмотра и ручного выбора нескольких схем используйте
+    :func:`calculate_variants`.
+    """
+    return calculate_variants(parts, sheet_width, gap, margin, length_step,
+                              quality=quality, max_variants=1)[0]
