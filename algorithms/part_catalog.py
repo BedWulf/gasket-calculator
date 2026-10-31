@@ -15,7 +15,8 @@ MAX_PIECES = 300
 def standard_part(*, kind: str, quantity: int = 1, name: str = "",
                   width: float = 0, height: float = 0,
                   diameter: float = 0, inner_diameter: float = 0,
-                  corner_radius: float = 0, rotate_allowed: bool = True) -> Part:
+                  corner_radius: float = 0, rotate_allowed: bool = True,
+                  grain_aligned: bool = False) -> Part:
     """Создать типовую деталь; имя заполняется по размеру, если оно пустое."""
     if kind not in STANDARD_KINDS:
         raise ValueError("В быстром вводе доступны только типовые формы")
@@ -34,7 +35,7 @@ def standard_part(*, kind: str, quantity: int = 1, name: str = "",
              diameter=diameter if kind in ("circle", "ring") else 0,
              inner_diameter=inner_diameter if kind == "ring" else 0,
              corner_radius=corner_radius if kind == "rounded_rectangle" else 0,
-             rotate_allowed=rotate_allowed)
+             rotate_allowed=rotate_allowed, grain_aligned=grain_aligned)
     p.check()
     return p
 

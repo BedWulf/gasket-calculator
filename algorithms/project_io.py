@@ -12,7 +12,7 @@ from algorithms.nesting import NestResult, Part, Placement, validate_result
 def result_from_dict(payload: dict) -> NestResult:
     if not isinstance(payload, dict):
         raise ValueError("Файл проекта должен содержать объект JSON")
-    if payload.get("schema_version") not in (1, 2):
+    if payload.get("schema_version") not in (1, 2, 3):
         raise ValueError("Неизвестная версия файла проекта")
     try:
         raw_parts = payload["parts"]
@@ -31,9 +31,11 @@ def result_from_dict(payload: dict) -> NestResult:
             margin=float(payload["margin"]),
             length_step=float(payload["length_step"]),
             parts=parts,
-            material_name=str(payload.get("material_name", "")) if payload["schema_version"] == 2 else "",
-            thickness_mm=float(payload.get("thickness_mm", 0)) if payload["schema_version"] == 2 else 0.0,
-            density_g_cm3=float(payload.get("density_g_cm3", 0)) if payload["schema_version"] == 2 else 0.0,
+            material_name=str(payload.get("material_name", "")) if payload["schema_version"] >= 2 else "",
+            thickness_mm=float(payload.get("thickness_mm", 0)) if payload["schema_version"] >= 2 else 0.0,
+            density_g_cm3=float(payload.get("density_g_cm3", 0)) if payload["schema_version"] >= 2 else 0.0,
+            kerf_mm=float(payload.get("kerf_mm", 0)) if payload["schema_version"] >= 3 else 0.0,
+            grain_direction=str(payload.get("grain_direction", "none")) if payload["schema_version"] >= 3 else "none",
         )
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"Не удалось прочитать параметры проекта: {exc}") from exc

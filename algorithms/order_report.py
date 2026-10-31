@@ -22,7 +22,10 @@ def build_order_report(result: NestResult) -> str:
         "=" * 52,
         f"Материал: {result.material_name.strip() or 'не указан'}",
         f"Размер заказываемого листа: {result.sheet_width:g} × {result.sheet_length:g} мм",
-        f"Зазор между деталями: {result.gap:g} мм",
+        f"Зазор между деталями (свободный материал): {result.gap:g} мм",
+        f"Ширина реза: {result.kerf_mm:g} мм",
+        f"Расчётное расстояние между контурами: {result.effective_gap:g} мм",
+        f"Направление материала: {dict(none='не задано', width='вдоль ширины', length='вдоль длины')[result.grain_direction]}",
         f"Отступ от кромки: {result.margin:g} мм",
         f"Кратность заказной длины: {result.length_step:g} мм",
         f"Деталей: {len(result.placements)} шт., типоразмеров: {len(result.parts)}",
@@ -53,11 +56,14 @@ def build_order_report(result: NestResult) -> str:
             dims = f"Ø{part.diameter:g} / Ø{part.inner_diameter:g} мм"
         else:
             dims = f"контур: {len(part.points)} вершин, отверстий: {len(part.holes)}"
-        lines.append(f"{i}. {part.name} — {part.quantity} шт.; {dims}; ")
+        lines.append(f"{i}. {part.name} — {part.quantity} шт.; {dims}; "
+                     f"ось X по материалу: {'да' if part.grain_aligned else 'нет'}")
     lines += [
         "", "ПРЕДУПРЕЖДЕНИЕ",
         "Результат получен эвристическим алгоритмом. Минимальная возможная длина",
         "не гарантируется. Перед заказом проверьте материал, направление",
         "прокатки, фактическую геометрию, технологию резки и необходимые припуски.",
+        "Ширина реза применяется как дополнительный консервативный зазор,",
+        "это НЕ управляющая программа станка и НЕ расчёт общего реза.",
     ]
     return "\n".join(lines) + "\n"

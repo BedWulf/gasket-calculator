@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
-from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtCore import QPointF, Qt, QTimer
 from PyQt6.QtGui import QColor, QBrush, QPen, QPainter, QPainterPath
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
-    QHeaderView,
+    QHeaderView, QScrollArea, QGridLayout,
 )
 from shapely.affinity import translate
 
@@ -94,6 +94,8 @@ class PartEditor(QDialog):
         self.diameter = _spin(part.diameter if part else 100)
         self.inner = _spin(part.inner_diameter if part else 40)
         self.radius = _spin(part.corner_radius if part else 10)
+        self.grain_aligned = QCheckBox("Ось X детали вдоль направления материала (прокатки/волокон)")
+        self.grain_aligned.setChecked(part.grain_aligned if part else False)
         self.rotation = QCheckBox("Разрешить повороты")
         self.rotation.setChecked(part.rotate_allowed if part else True)
         self.rotation_step = QComboBox()
@@ -120,13 +122,15 @@ class PartEditor(QDialog):
         main = QVBoxLayout(self)
         main.addLayout(form)
         main.addWidget(self.rotation)
+        main.addWidget(self.grain_aligned)
         step_row = QFormLayout()
         step_row.addRow("Шаг поворота сложного контура:", self.rotation_step)
         main.addLayout(step_row)
         self.open_drawer = QPushButton("✏ Нарисовать / изменить контур мышью")
         self.open_drawer.clicked.connect(self.open_contour_editor)
         main.addWidget(self.open_drawer)
-        help_label = QLabel("Координаты в миллиметрах. Контур и отверстия должны быть замкнутыми по смыслу; "+
+        help_label = QLabel("Координаты в миллиметрах. Для соблюдения прокатки отметьте ось X и "
+                            "укажите направление листа в основном окне. Контур и отверстия замкнуты; "+
                             "последняя вершина соединяется с первой автоматически. Без самопересечений.")
         help_label.setWordWrap(True)
         main.addWidget(help_label)
@@ -186,6 +190,7 @@ class PartEditor(QDialog):
                 if self.kind.currentData() == "polygon" else [],
                 rotate_allowed=self.rotation.isChecked(),
                 rotation_step=self.rotation_step.currentData(),
+                grain_aligned=self.grain_aligned.isChecked(),
             )
             part.check()
             self._part = part
@@ -238,6 +243,69 @@ class SheetView(QGraphicsView):
     def wheelEvent(self, event):
         self.scale(1.15 if event.angleDelta().y() > 0 else 1/1.15,
                    1.15 if event.angleDelta().y() > 0 else 1/1.15)
+
+
+class VariantsComparisonDialog(QDialog):
+    """До шести схем рядом: геометрия только для просмотра, выбор в основном окне."""
+
+    def __init__(self, variants: list[NestResult], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Сравнение вариантов раскроя")
+        self.resize(1050, 740)
+        self.selected_index: int | None = None
+        self.previews = []
+        root = QVBoxLayout(self)
+        note = QLabel("Сравните длину, площадь отходов и положение деталей. "
+                      "Выбранный вариант появится в основном окне для проверки и редактирования.")
+        note.setWordWrap(True)
+        root.addWidget(note)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        wrap = QWidget()
+        grid = QGridLayout(wrap)
+        for i, result in enumerate(variants):
+            panel = QGroupBox(("Рекомендуемый · " if i == 0 else "") + f"Вариант {i+1}")
+            layout = QVBoxLayout(panel)
+            metrics = QLabel(f"<b>{result.sheet_width:g} × {result.sheet_length:g} мм</b>  |  "
+                             f"Использование: {result.utilization:.1f}%<br>"
+                             f"Отходы: {result.waste_area/1e6:.5f} м²")
+            layout.addWidget(metrics)
+            scene = QGraphicsScene(panel)
+            scene.addRect(0, 0, result.sheet_width, result.sheet_length,
+                          QPen(QColor('#343a40'), 1), QBrush(QColor('white')))
+            for placement in result.placements:
+                geometry = oriented_geometry(result.parts[placement.part_index], placement.angle)
+                item = scene.addPath(_path_for_geom(geometry))
+                color = QColor(COLORS[placement.part_index % len(COLORS)])
+                color.setAlpha(170)
+                item.setBrush(QBrush(color))
+                item.setPen(QPen(color.darker(160), 0.75))
+                item.setPos(placement.x, placement.y)
+            view = QGraphicsView(scene)
+            view.setRenderHint(QPainter.RenderHint.Antialiasing)
+            view.setBackgroundBrush(QColor('#e6e8eb'))
+            view.setMinimumSize(235, 205)
+            layout.addWidget(view, 1)
+            button = QPushButton("Выбрать эту раскладку")
+            button.clicked.connect(lambda _, index=i: self._choose(index))
+            layout.addWidget(button)
+            grid.addWidget(panel, i // 3, i % 3)
+            self.previews.append(view)
+        scroll.setWidget(wrap)
+        root.addWidget(scroll, stretch=1)
+        close = QPushButton("Закрыть без выбора")
+        close.clicked.connect(self.reject)
+        root.addWidget(close)
+        QTimer.singleShot(0, self._fit_previews)
+
+    def _fit_previews(self):
+        for view in self.previews:
+            view.fitInView(view.scene().sceneRect().adjusted(-4, -4, 4, 4),
+                           Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _choose(self, index: int):
+        self.selected_index = index
+        self.accept()
 
 
 class OrderSheetDialog(QDialog):
@@ -305,6 +373,24 @@ class OrderSheetDialog(QDialog):
         self.material_details.setVisible(False)
         self.material_details_toggle.toggled.connect(self._toggle_material_details)
         l.addWidget(self.material_details)
+        self.technology_toggle = QPushButton("▶ Технология резки и направление материала")
+        self.technology_toggle.setCheckable(True)
+        l.addWidget(self.technology_toggle)
+        self.technology_details = QWidget()
+        technology = QFormLayout(self.technology_details)
+        self.kerf = _spin(0, 0, 100, 2)
+        self.kerf.setToolTip("Дополнительно к зазору: учитывается ширина удаляемого резом материала. "
+                             "Отступ от края увеличивается на половину ширины реза.")
+        self.grain_direction = QComboBox()
+        for label, value in (("Не задано", "none"),
+                             ("Вдоль ширины листа (ось X)", "width"),
+                             ("Вдоль длины листа (ось Y)", "length")):
+            self.grain_direction.addItem(label, value)
+        technology.addRow("Ширина реза:", self.kerf)
+        technology.addRow("Направление материала:", self.grain_direction)
+        self.technology_details.setVisible(False)
+        self.technology_toggle.toggled.connect(self._toggle_technology_details)
+        l.addWidget(self.technology_details)
         self._build_quick_entry(l)
         l.addWidget(QLabel("Список деталей — раскрой одним листом"))
         self.table = QTableWidget(0, 3)
@@ -351,6 +437,10 @@ class OrderSheetDialog(QDialog):
         self.variant_combo.currentIndexChanged.connect(self._select_variant)
         variant_row.addWidget(self.variant_combo, stretch=1)
         l.addLayout(variant_row)
+        self.compare_button = QPushButton("▦ Сравнить схемы рядом")
+        self.compare_button.setEnabled(False)
+        self.compare_button.clicked.connect(self.compare_variants)
+        l.addWidget(self.compare_button)
         self.summary = QLabel("Укажите ширину и количество деталей. Длина вычисляется автоматически. Все размеры — в мм.")
         self.summary.setWordWrap(True)
         self.summary.setMinimumHeight(110)
@@ -381,15 +471,21 @@ class OrderSheetDialog(QDialog):
         split.setSizes([490, 850])
         # После изменения входных параметров прежний раскрой неактуален.
         for spin in (self.sheet_width, self.gap, self.margin, self.step,
-                     self.thickness, self.density):
+                     self.thickness, self.density, self.kerf):
             spin.valueChanged.connect(self._reset_layout)
         self.material_name.textChanged.connect(self._reset_layout)
         self.quality.currentIndexChanged.connect(self._reset_layout)
+        self.grain_direction.currentIndexChanged.connect(self._reset_layout)
 
     def _toggle_material_details(self, visible: bool):
         self.material_details.setVisible(visible)
         self.material_details_toggle.setText(
             ("▼" if visible else "▶") + " Материал и масса (необязательно)")
+
+    def _toggle_technology_details(self, visible: bool):
+        self.technology_details.setVisible(visible)
+        self.technology_toggle.setText(
+            ("▼" if visible else "▶") + " Технология резки и направление материала")
 
     def _build_quick_entry(self, layout: QVBoxLayout):
         """Постоянно видимая форма быстрого ввода типовых деталей."""
@@ -410,6 +506,7 @@ class OrderSheetDialog(QDialog):
         self.quick_radius = _spin(10, 0)
         self.quick_rotation = QCheckBox("Разрешить поворот детали")
         self.quick_rotation.setChecked(True)
+        self.quick_grain = QCheckBox("Соблюдать ось X детали по направлению материала")
         for label, field in (
             ("Форма:", self.quick_kind), ("Название:", self.quick_name),
             ("Количество:", self.quick_qty), ("Ширина:", self.quick_width),
@@ -418,6 +515,7 @@ class OrderSheetDialog(QDialog):
         ):
             form.addRow(label, field)
         form.addRow("", self.quick_rotation)
+        form.addRow("", self.quick_grain)
         self.quick_submit = QPushButton("＋ Добавить в список")
         form.addRow(self.quick_submit)
         self.quick_submit.clicked.connect(self.add_quick_part)
@@ -450,7 +548,8 @@ class OrderSheetDialog(QDialog):
                 quantity=self.quick_qty.value(), width=self.quick_width.value(),
                 height=self.quick_height.value(), diameter=self.quick_diameter.value(),
                 inner_diameter=self.quick_inner.value(), corner_radius=self.quick_radius.value(),
-                rotate_allowed=self.quick_rotation.isChecked())
+                rotate_allowed=self.quick_rotation.isChecked(),
+                grain_aligned=self.quick_grain.isChecked())
             self.parts = add_to_order(self.parts, part)
         except ValueError as exc:
             QMessageBox.warning(self, "Проверьте размеры детали", str(exc))
@@ -499,6 +598,7 @@ class OrderSheetDialog(QDialog):
         self._updating_variants = True
         self.variant_combo.clear()
         self.variant_combo.setEnabled(False)
+        self.compare_button.setEnabled(False)
         self._updating_variants = False
         self.scene.clear()
         self.items = []
@@ -584,6 +684,7 @@ class OrderSheetDialog(QDialog):
             label = self._variant_label(i, candidate)
             self.variant_combo.addItem(("Загружено · " if loaded else "") + label)
         self.variant_combo.setEnabled(len(candidates) > 1)
+        self.compare_button.setEnabled(len(candidates) > 1)
         self.variant_combo.setCurrentIndex(self._variant_index)
         self._updating_variants = False
         self.result = deepcopy(candidates[0]) if candidates else None
@@ -601,12 +702,23 @@ class OrderSheetDialog(QDialog):
         self.result = deepcopy(self.variants[index])
         self._draw_scene()
 
+    def compare_variants(self):
+        if len(self.variants) < 2:
+            return
+        if self.result is not None and 0 <= self._variant_index < len(self.variants):
+            self.variants[self._variant_index] = deepcopy(self.result)
+        dialog = VariantsComparisonDialog(self.variants, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_index is not None:
+            self.variant_combo.setCurrentIndex(dialog.selected_index)
+
     def calculate(self):
         try:
             candidates = calculate_variants(
                 self.parts, self.sheet_width.value(), self.gap.value(),
                 self.margin.value(), self.step.value(),
-                quality=self.quality.currentData(), max_variants=6)
+                quality=self.quality.currentData(), max_variants=6,
+                kerf_mm=self.kerf.value(),
+                grain_direction=self.grain_direction.currentData())
             for candidate in candidates:
                 candidate.material_name = self.material_name.text().strip()
                 candidate.thickness_mm = self.thickness.value()
@@ -661,6 +773,8 @@ class OrderSheetDialog(QDialog):
             f"Площадь листа: {r.sheet_area/1e6:.4f} м²<br>"
             f"Использование материала: {r.utilization:.1f}%<br>"
             f"Отходы (включая зазоры): {r.waste_area/1e6:.4f} м²<br>"
+            f"Расчётный промежуток с резом: {r.effective_gap:g} мм; "
+            f"допуск у края: {r.effective_margin:g} мм.<br>"
             f"Теоретическая нижняя граница длины: {r.order_length_lower_bound:g} мм.<br>"
             + (f"Масса листа: {r.purchased_mass_kg:.3f} кг; "
                f"масса деталей: {r.parts_mass_kg:.3f} кг.<br>"
@@ -677,13 +791,16 @@ class OrderSheetDialog(QDialog):
         g = translate(oriented_geometry(r.parts[p.part_index], p.angle),x,y)
         a,b,c,d = g.bounds
         eps = 1e-6
-        if a < r.margin-eps or b < r.margin-eps or c > r.sheet_width-r.margin+eps or d > r.sheet_length-r.margin+eps:
+        if (a < r.effective_margin-eps or b < r.effective_margin-eps or
+                c > r.sheet_width-r.effective_margin+eps or
+                d > r.sheet_length-r.effective_margin+eps):
             return False
         for j, other_p in enumerate(r.placements):
             if index == j:
                 continue
             other = translate(oriented_geometry(r.parts[other_p.part_index],other_p.angle),other_p.x,other_p.y)
-            if (g.intersection(other).area > eps if r.gap == 0 else g.distance(other) < r.gap-eps):
+            if (g.intersection(other).area > eps if r.effective_gap == 0 else
+                    g.distance(other) < r.effective_gap-eps):
                 return False
         return True
 
@@ -719,6 +836,10 @@ class OrderSheetDialog(QDialog):
             self.gap.setValue(result.gap)
             self.margin.setValue(result.margin)
             self.step.setValue(result.length_step)
+            self.kerf.setValue(result.kerf_mm)
+            self.grain_direction.setCurrentIndex(
+                self.grain_direction.findData(result.grain_direction))
+            self.technology_toggle.setChecked(bool(result.kerf_mm or result.grain_direction != "none"))
             self.material_name.setText(result.material_name)
             self.thickness.setValue(result.thickness_mm)
             self.density.setValue(result.density_g_cm3)

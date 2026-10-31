@@ -40,6 +40,8 @@ class Part:
     # Для сложных контуров: допустимый шаг поворота в тщательном поиске.
     # По умолчанию 45° для обратной совместимости с заданиями v1-v3.
     rotation_step: int = 45
+    # Локальная ось X детали должна совпадать с направлением материала.
+    grain_aligned: bool = False
 
     def geometry(self) -> BaseGeometry:
         """Получить контур с локальным левым верхним углом (0,0).
@@ -120,6 +122,18 @@ class NestResult:
     material_name: str = ""
     thickness_mm: float = 0.0
     density_g_cm3: float = 0.0
+    # Дополнительный технологический рез: консервативно увеличивает зазор
+    # между деталями и требует по половине ширины реза у каждой кромки.
+    kerf_mm: float = 0.0
+    grain_direction: str = "none"  # none, width или length
+
+    @property
+    def effective_gap(self) -> float:
+        return self.gap + self.kerf_mm
+
+    @property
+    def effective_margin(self) -> float:
+        return self.margin + self.kerf_mm / 2
 
     @property
     def material_area(self) -> float:
@@ -145,8 +159,8 @@ class NestResult:
         прямоугольника полезной ширины. Междетальные зазоры здесь намеренно
         не учитываются: это математически допустимая, но слабая граница.
         """
-        usable_width = self.sheet_width - 2 * self.margin
-        return 2 * self.margin + self.material_area / usable_width
+        usable_width = self.sheet_width - 2 * self.effective_margin
+        return 2 * self.effective_margin + self.material_area / usable_width
 
     @property
     def order_length_lower_bound(self) -> float:
@@ -158,14 +172,14 @@ class NestResult:
         """
         min_per_part = []
         for part in self.parts:
-            valid_heights = [g.bounds[3] for a in allowed_angles(part, thorough=True)
+            valid_heights = [g.bounds[3] for a in allowed_angles(part, thorough=True, grain_direction=self.grain_direction)
                              for g in [oriented_geometry(part, a)]
-                             if g.bounds[2] <= self.sheet_width - 2*self.margin + 1e-8]
+                             if g.bounds[2] <= self.sheet_width - 2*self.effective_margin + 1e-8]
             if not valid_heights:
                 raise ValueError(f"Деталь «{part.name}» не проходит по ширине листа")
             min_per_part.append(min(valid_heights))
         return _round_up(max(self.area_lower_bound,
-                             max(min_per_part) + 2*self.margin), self.length_step)
+                             max(min_per_part) + 2*self.effective_margin), self.length_step)
 
     @property
     def purchased_mass_kg(self) -> float | None:
@@ -185,10 +199,13 @@ class NestResult:
 
     def to_dict(self) -> dict:
         return {
-            "schema_version": 2,
+            "schema_version": (3 if self.kerf_mm or self.grain_direction != "none"
+                               or any(p.grain_aligned for p in self.parts) else 2),
             "material_name": self.material_name,
             "thickness_mm": self.thickness_mm,
             "density_g_cm3": self.density_g_cm3,
+            "kerf_mm": self.kerf_mm,
+            "grain_direction": self.grain_direction,
             "sheet_width": self.sheet_width,
             "sheet_length": self.sheet_length,
             "gap": self.gap, "margin": self.margin, "length_step": self.length_step,
@@ -206,33 +223,48 @@ def oriented_geometry(part: Part, angle: int) -> BaseGeometry:
     return g
 
 
-def allowed_angles(part: Part, *, thorough: bool = False) -> tuple[int, ...]:
-    """Разрешённые ориентации для раскладки и проверки сохранённых проектов.
+def allowed_angles(part: Part, *, thorough: bool = False,
+                   grain_direction: str = "none") -> tuple[int, ...]:
+    """Разрешённые повороты с учётом ориентации материала.
 
-    В быстром режиме для сложной формы используем шаг 90°; в тщательном
-    режиме — заданный пользователем шаг. Прямоугольники можно поворачивать
-    на 90°, круги и кольца не требуют поворота.
+    Для детали с grain_aligned=True локальная ось X должна быть параллельна
+    оси прокатки листа. Вращение на 180° сохраняет это направление.
     """
     if not part.rotate_allowed:
-        return (0,)
-    if part.kind == "polygon":
-        step = part.rotation_step if thorough else 90
-        return tuple(range(0, 360, step))
-    if part.kind in ("circle", "ring"):
-        return (0,)
-    return (0, 90)
+        options = (0,)
+    elif part.kind == "polygon":
+        options = tuple(range(0, 360, part.rotation_step if thorough else 90))
+    elif part.kind in ("circle", "ring"):
+        options = (0,)
+    else:
+        options = (0, 90)
+    if not part.grain_aligned:
+        return options
+    if grain_direction not in ("width", "length"):
+        return ()
+    # Явная ориентация нужна даже для круглых заготовок с волокнами.
+    if part.rotate_allowed:
+        if part.kind in ("circle", "ring"):
+            options = (0, 90, 180, 270)
+        elif part.kind != "polygon":
+            options = (0, 90, 180, 270)
+    locked = (0, 180) if grain_direction == "width" else (90, 270)
+    return tuple(angle for angle in options if angle in locked)
 
 
 def validate_result(result: NestResult) -> bool:
     """Полная проверка с учётом отверстий, отступа и междетального зазора."""
     if not all(isfinite(v) for v in (result.sheet_width, result.sheet_length,
                         result.gap, result.margin, result.length_step,
-                        result.thickness_mm, result.density_g_cm3)):
+                        result.thickness_mm, result.density_g_cm3,
+                        result.kerf_mm)):
         return False
     if (result.sheet_width <= 0 or result.sheet_length <= 0 or
             result.length_step <= 0 or result.gap < 0 or result.margin < 0 or
             result.thickness_mm < 0 or result.density_g_cm3 < 0 or
-            result.sheet_width <= 2*result.margin or result.sheet_length <= 2*result.margin):
+            result.kerf_mm < 0 or result.grain_direction not in ("none", "width", "length") or
+            result.sheet_width <= 2*result.effective_margin or
+            result.sheet_length <= 2*result.effective_margin):
         return False
     if abs(result.sheet_length / result.length_step - round(result.sheet_length / result.length_step)) > 1e-5:
         return False
@@ -242,6 +274,8 @@ def validate_result(result: NestResult) -> bool:
         for part in result.parts:
             part.check()
     except (ValueError, TypeError):
+        return False
+    if result.grain_direction == "none" and any(p.grain_aligned for p in result.parts):
         return False
     shapes: list[BaseGeometry] = []
     counts = [0] * len(result.parts)
@@ -256,9 +290,10 @@ def validate_result(result: NestResult) -> bool:
         # Сохраняем совместимость загрузки, хотя для поиска эти повороты
         # бесполезны из-за симметрии или эквивалентны перестановке 90°.
         if part.kind != "polygon" and part.rotate_allowed:
-            allowed = (0, 90, 180, 270)
+            allowed = ((0, 90, 180, 270) if not part.grain_aligned else
+                       allowed_angles(part, thorough=True, grain_direction=result.grain_direction))
         else:
-            allowed = allowed_angles(part, thorough=True)
+            allowed = allowed_angles(part, thorough=True, grain_direction=result.grain_direction)
         if p.angle not in allowed:
             return False
         try:
@@ -266,15 +301,15 @@ def validate_result(result: NestResult) -> bool:
         except ValueError:
             return False
         x0,y0,x1,y1 = g.bounds
-        if (x0 < result.margin-epsilon or y0 < result.margin-epsilon or
-                x1 > result.sheet_width-result.margin+epsilon or
-                y1 > result.sheet_length-result.margin+epsilon):
+        if (x0 < result.effective_margin-epsilon or y0 < result.effective_margin-epsilon or
+                x1 > result.sheet_width-result.effective_margin+epsilon or
+                y1 > result.sheet_length-result.effective_margin+epsilon):
             return False
         for old in shapes:
-            if result.gap == 0:
+            if result.effective_gap == 0:
                 if g.intersection(old).area > epsilon:
                     return False
-            elif g.distance(old) < result.gap-epsilon:
+            elif g.distance(old) < result.effective_gap-epsilon:
                 return False
         counts[p.part_index] += 1
         shapes.append(g)
@@ -288,36 +323,41 @@ def _round_up(x: float, step: float) -> float:
 def _attempt(parts: list[Part], order: list[int], width: float,
              gap: float, margin: float, step: float,
              vertex_anchors: bool = False, deadline: float | None = None,
-             fine_angles: bool = False) -> NestResult:
+             fine_angles: bool = False, kerf_mm: float = 0.0,
+             grain_direction: str = "none") -> NestResult:
+    effective_gap = gap + kerf_mm
+    effective_margin = margin + kerf_mm / 2
     existing: list[tuple[BaseGeometry, tuple[float, float, float, float]]] = []
     placed: list[Placement] = []
-    top = margin
-    allowed_right = width - margin
+    top = effective_margin
+    allowed_right = width - effective_margin
     for idx in order:
         if deadline is not None and monotonic() >= deadline:
             raise TimeoutError('Лимит времени подробного поиска')
         part = parts[idx]
         # Внимание: для сложных деталей ориентация ограничивается их
         # rotation_step, иначе направление прокатки может быть нарушено.
-        rotations = allowed_angles(part, thorough=fine_angles)
+        rotations = allowed_angles(part, thorough=fine_angles, grain_direction=grain_direction)
         options = [(angle, oriented_geometry(part, angle)) for angle in rotations]
+        if not options:
+            raise ValueError(f"Деталь «{part.name}»: допустимый поворот противоречит направлению материала")
         best = None
         for angle, shape in options:
             w = shape.bounds[2]
             h = shape.bounds[3]
-            if w > width-2*margin+1e-8:
+            if w > width-2*effective_margin+1e-8:
                 continue
             # Возможные опорные координаты задают существующие детали и кромки.
             # По двум осям проверяются комбинации: это позволяет заполнять
             # пустоты, включая отверстия в уже размещённых контурах.
-            x_anchor = {round(margin, 5), round(allowed_right-w, 5)}
-            y_anchor = {round(margin, 5), round(top+gap, 5)}
+            x_anchor = {round(effective_margin, 5), round(allowed_right-w, 5)}
+            y_anchor = {round(effective_margin, 5), round(top+effective_gap, 5)}
             for _, (a,b,c,d) in existing:
-                for x in (a, c+gap, a-w-gap, c-w, c-w-gap):
-                    if margin-1e-8 <= x <= allowed_right-w+1e-8:
+                for x in (a, c+effective_gap, a-w-effective_gap, c-w, c-w-effective_gap):
+                    if effective_margin-1e-8 <= x <= allowed_right-w+1e-8:
                         x_anchor.add(round(x, 5))
-                for y in (b, d+gap, b-h-gap, d-h, d-h+gap):
-                    if y >= margin-1e-8:
+                for y in (b, d+effective_gap, b-h-effective_gap, d-h, d-h+effective_gap):
+                    if y >= effective_margin-1e-8:
                         y_anchor.add(round(y, 5))
             # Укладка кругов со смещением рядов (треугольная решётка).
             # Раньше опорные точки были только у границ описывающих
@@ -330,17 +370,17 @@ def _attempt(parts: list[Part], order: list[int], width: float,
                     if old_part.kind not in ("circle", "ring"):
                         continue
                     old_radius = old_part.diameter / 2
-                    separation = radius + old_radius + gap
+                    separation = radius + old_radius + effective_gap
                     dx = separation / 2
                     dy = sqrt(max(0, separation**2 - dx**2))
                     ox = (obox[0] + obox[2]) / 2
                     oy = (obox[1] + obox[3]) / 2
                     for sign in (-1, 1):
                         x = ox + sign * dx - radius
-                        if margin-1e-8 <= x <= allowed_right-w+1e-8:
+                        if effective_margin-1e-8 <= x <= allowed_right-w+1e-8:
                             x_anchor.add(round(x, 5))
                     y = oy + dy - radius
-                    if y >= margin-1e-8:
+                    if y >= effective_margin-1e-8:
                         # +0.0001 мм устраняет погрешности аппроксимации окружности.
                         y_anchor.add(round(y + 0.0001, 5))
 
@@ -351,11 +391,11 @@ def _attempt(parts: list[Part], order: list[int], width: float,
                 for poly in geom_list:
                     for ring in poly.interiors:
                         a,b,c,d = ring.bounds
-                        for x in (a+gap, c-w-gap):
-                            if margin <= x <= allowed_right-w:
+                        for x in (a+effective_gap, c-w-effective_gap):
+                            if effective_margin <= x <= allowed_right-w:
                                 x_anchor.add(round(x, 5))
-                        for y in (b+gap, d-h-gap):
-                            if y >= margin:
+                        for y in (b+effective_gap, d-h-effective_gap):
+                            if y >= effective_margin:
                                 y_anchor.add(round(y, 5))
                         # В не прямоугольном отверстии угловые кандидаты
                         # иногда не подходят. Центрирование в реальном
@@ -366,9 +406,9 @@ def _attempt(parts: list[Part], order: list[int], width: float,
                             part_center = shape.centroid
                             xcenter = center.x - part_center.x
                             ycenter = center.y - part_center.y
-                            if margin <= xcenter <= allowed_right-w:
+                            if effective_margin <= xcenter <= allowed_right-w:
                                 x_anchor.add(round(xcenter, 5))
-                            if ycenter >= margin:
+                            if ycenter >= effective_margin:
                                 y_anchor.add(round(ycenter, 5))
             # Дополнительные опорные точки: вершины сложных контуров (в т.ч.
             # вырезов). Это помогает стыковать L-образные и нестандартные формы,
@@ -390,11 +430,11 @@ def _attempt(parts: list[Part], order: list[int], width: float,
                     target_vertices = list(sample_vertices(old, 14))
                     for vx, vy in target_vertices:
                         for px, py in source_vertices:
-                            for x in (vx - px, vx - px + gap, vx - px - gap):
-                                if margin - 1e-8 <= x <= allowed_right-w+1e-8:
+                            for x in (vx - px, vx - px + effective_gap, vx - px - effective_gap):
+                                if effective_margin - 1e-8 <= x <= allowed_right-w+1e-8:
                                     x_anchor.add(round(x, 5))
-                            for y in (vy - py, vy - py + gap, vy - py - gap):
-                                if y >= margin - 1e-8:
+                            for y in (vy - py, vy - py + effective_gap, vy - py - effective_gap):
+                                if y >= effective_margin - 1e-8:
                                     y_anchor.add(round(y, 5))
             # Предпочитаем положения с небольшой высотой и близко к левому краю.
             # Предел устраняет взрыв сложности на крупных заказах.
@@ -415,11 +455,11 @@ def _attempt(parts: list[Part], order: list[int], width: float,
                     collision = False
                     for other, obox in existing:
                         # Быстрая проверка описывающих рамок до Shapely.distance().
-                        if (bbox[2]+gap <= obox[0]+1e-7 or obox[2]+gap <= bbox[0]+1e-7 or
-                            bbox[3]+gap <= obox[1]+1e-7 or obox[3]+gap <= bbox[1]+1e-7):
+                        if (bbox[2]+effective_gap <= obox[0]+1e-7 or obox[2]+effective_gap <= bbox[0]+1e-7 or
+                            bbox[3]+effective_gap <= obox[1]+1e-7 or obox[3]+effective_gap <= bbox[1]+1e-7):
                             continue
-                        if (geom.intersection(other).area > 1e-7 if gap == 0
-                            else geom.distance(other) < gap-1e-7):
+                        if (geom.intersection(other).area > 1e-7 if effective_gap == 0
+                            else geom.distance(other) < effective_gap-1e-7):
                             collision = True
                             break
                     if not collision:
@@ -432,8 +472,9 @@ def _attempt(parts: list[Part], order: list[int], width: float,
         placed.append(Placement(idx, x, y, angle))
         existing.append((geom, geom.bounds))
         top = max(top, geom.bounds[3])
-    length = _round_up(top + margin, step)
-    result = NestResult(width, length, placed, gap, margin, step, parts)
+    length = _round_up(top + effective_margin, step)
+    result = NestResult(width, length, placed, gap, margin, step, parts,
+                        kerf_mm=kerf_mm, grain_direction=grain_direction)
     if not validate_result(result):
         raise RuntimeError("Ошибка внутренней проверки раскроя")
     return result
@@ -443,7 +484,8 @@ def calculate_variants(parts: list[Part], sheet_width: float,
                     gap: float = 0.0, margin: float = 0.0,
                     length_step: float = 1.0,
                     quality: str = "standard",
-                    max_variants: int = 6) -> list[NestResult]:
+                    max_variants: int = 6, kerf_mm: float = 0.0,
+                    grain_direction: str = "none") -> list[NestResult]:
     """Подобрать и вернуть несколько РАЗНЫХ корректных раскладок листа.
 
     Отсортированы по длине заказного листа; расход материала для одной
@@ -465,16 +507,20 @@ def calculate_variants(parts: list[Part], sheet_width: float,
         raise ValueError("Количество вариантов должно быть от 1 до 20")
     if quality not in ("standard", "thorough"):
         raise ValueError("Неизвестный режим качества раскроя")
-    if not all(isfinite(v) for v in (sheet_width, gap, margin, length_step)):
+    if not all(isfinite(v) for v in (sheet_width, gap, margin, length_step, kerf_mm)):
         raise ValueError("Введите конечные числовые значения")
-    if sheet_width <= 0 or gap < 0 or margin < 0 or length_step <= 0:
+    if sheet_width <= 0 or gap < 0 or margin < 0 or length_step <= 0 or kerf_mm < 0:
         raise ValueError("Ширина и шаг должны быть положительными; зазор и отступ неотрицательные")
-    if sheet_width <= 2*margin:
-        raise ValueError("Двойной отступ больше доступной ширины листа")
+    if grain_direction not in ("none", "width", "length"):
+        raise ValueError("Неизвестное направление материала")
+    if sheet_width <= 2*(margin + kerf_mm/2):
+        raise ValueError("Отступ и ширина реза оставляют слишком мало ширины листа")
     if not parts:
         raise ValueError("Добавьте минимум одну деталь")
     for p in parts:
         p.check()
+        if not allowed_angles(p, thorough=True, grain_direction=grain_direction):
+            raise ValueError(f"Деталь «{p.name}»: укажите направление материала или разрешите подходящий поворот")
     if sum(p.quantity for p in parts) > 300:
         raise ValueError("В одном задании допускается не больше 300 деталей")
     geoms = [p.geometry() for p in parts]
@@ -490,7 +536,8 @@ def calculate_variants(parts: list[Part], sheet_width: float,
     for sorter in strategies:
         order = sorted(quantities, key=sorter)
         try:
-            results.append(_attempt(parts, order, sheet_width, gap, margin, length_step))
+            results.append(_attempt(parts, order, sheet_width, gap, margin, length_step,
+                                    kerf_mm=kerf_mm, grain_direction=grain_direction))
         except ValueError:
             continue
     # Контурные якоря существенно дороже. На больших заказах не включаем
@@ -512,7 +559,8 @@ def calculate_variants(parts: list[Part], sheet_width: float,
             try:
                 results.append(_attempt(parts, order, sheet_width, gap, margin, length_step,
                                         vertex_anchors=has_polygons, deadline=deadline,
-                                        fine_angles=has_polygons))
+                                        fine_angles=has_polygons, kerf_mm=kerf_mm,
+                                        grain_direction=grain_direction))
             except TimeoutError:
                 break
             except ValueError:
@@ -541,11 +589,13 @@ def calculate_variants(parts: list[Part], sheet_width: float,
 def calculate_sheet(parts: list[Part], sheet_width: float,
                     gap: float = 0.0, margin: float = 0.0,
                     length_step: float = 1.0,
-                    quality: str = "standard") -> NestResult:
+                    quality: str = "standard", kerf_mm: float = 0.0,
+                    grain_direction: str = "none") -> NestResult:
     """Обратная совместимость: лучший из доступных вариантов раскроя.
 
     Для просмотра и ручного выбора нескольких схем используйте
     :func:`calculate_variants`.
     """
     return calculate_variants(parts, sheet_width, gap, margin, length_step,
-                              quality=quality, max_variants=1)[0]
+                              quality=quality, max_variants=1, kerf_mm=kerf_mm,
+                              grain_direction=grain_direction)[0]
