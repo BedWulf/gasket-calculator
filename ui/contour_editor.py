@@ -374,31 +374,51 @@ class ContourEditor(QDialog):
             return
         self._snapshot();del self.rings[ring_id][idx];self._draw_all()
 
-    def _hole_dialog(self,round_hole):
-        d=QDialog(self);d.setWindowTitle('Круглое отверстие' if round_hole else 'Прямоугольное отверстие')
+    def _hole_dialog(self,round_hole,center=None):
+        d=QDialog(self)
+        d.setWindowTitle('Круглое отверстие' if round_hole else 'Прямоугольное отверстие')
         layout=QVBoxLayout(d);form=QFormLayout();layout.addLayout(form)
-        cx=_qspin(30);cy=_qspin(30);form.addRow('X левого края/центра:',cx);form.addRow('Y левого края/центра:',cy)
-        w=_qspin(15,0.01);form.addRow('Радиус:' if round_hole else 'Ширина:',w)
+        xs=[p[0] for p in self.rings[0]]
+        ys=[p[1] for p in self.rings[0]]
+        left,right=min(xs),max(xs)
+        top,bottom=min(ys),max(ys)
+        mid=center or ((left+right)/2,(top+bottom)/2)
+        cx=_qspin(mid[0]);cy=_qspin(mid[1])
+        form.addRow('X центра:',cx)
+        form.addRow('Y центра:',cy)
+        suggestion=max(0.01,min(right-left,bottom-top)/4)
+        w=_qspin(suggestion,0.01)
+        form.addRow('Диаметр:' if round_hole else 'Ширина:',w)
         h=None
         if not round_hole:
-            h=_qspin(15,0.01);form.addRow('Высота:',h)
+            h=_qspin(suggestion,0.01);form.addRow('Высота:',h)
         btn=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
         btn.accepted.connect(d.accept);btn.rejected.connect(d.reject);layout.addWidget(btn)
         if d.exec()!=QDialog.DialogCode.Accepted:return None
-        x,y=cx.value(),cy.value()
+        center=(cx.value(),cy.value())
         if round_hole:
-            return [(x+w.value()*cos(2*pi*i/72),y+w.value()*sin(2*pi*i/72)) for i in range(72)]
-        return [(x,y),(x+w.value(),y),(x+w.value(),y+h.value()),(x,y+h.value())]
+            return circular_hole(center,w.value())
+        return rectangular_hole(center,w.value(),h.value())
 
-    def _add_hole(self,round_hole):
-        hole=self._hole_dialog(round_hole)
+    def _add_hole(self,round_hole,center=None):
+        hole=self._hole_dialog(round_hole,center)
         if hole is None:return
-        self._snapshot();self.rings.append(hole)
-        try:self._polygon_check()
-        except ValueError as e:
-            self.rings=self.undo_stack.pop()
-            QMessageBox.warning(self,'Отверстие не помещается',str(e));return
-        self._draw_all();self.active_ring.setCurrentIndex(len(self.rings)-1)
+        candidate=deepcopy(self.rings)
+        candidate.append(hole)
+        if self._apply_candidate(candidate,'Отверстие не помещается'):
+            self.active_ring.setCurrentIndex(len(self.rings)-1)
+
+    def _set_placement_mode(self,kind):
+        self.placement_kind=kind
+        self.place_rect_button.setChecked(kind=='rectangle')
+        self.place_round_button.setChecked(kind=='circle')
+        if kind is None:
+            self.view.unsetCursor()
+            self.place_info.setText('Щелчок на чертеже задаст центр отверстия.')
+        else:
+            self.view.setCursor(Qt.CursorShape.CrossCursor)
+            self.place_info.setText('Щёлкните место центра на чертеже, затем уточните размеры. '
+                                    'Повторное нажатие кнопки отменяет режим.')
 
     def add_rect_hole(self):self._add_hole(False)
     def add_round_hole(self):self._add_hole(True)
