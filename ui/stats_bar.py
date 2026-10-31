@@ -101,4 +101,4 @@ class StatsPanel(QFrame):
         elif is_rotated:
             self.title.setText("Результаты (детали повёрнуты на 90°)")
         else:
-            self.title.setText("Результаты (оптимальный вариант)")
+            self.title.setText("Результаты (детали без поворота)")

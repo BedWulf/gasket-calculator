@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "sheet_width": 110,
+  "sheet_length": 110.0,
+  "gap": 0.0,
+  "margin": 0.0,
+  "length_step": 1.0,
+  "parts": [
+    {
+      "name": "Кольцо",
+      "kind": "ring",
+      "quantity": 1,
+      "width": 0.0,
+      "height": 0.0,
+      "diameter": 110,
+      "inner_diameter": 70,
+      "corner_radius": 0.0,
+      "points": [],
+      "holes": [],
+      "rotate_allowed": true,
+      "rotation_step": 45
+    },
+    {
+      "name": "Вставка",
+      "kind": "rectangle",
+      "quantity": 1,
+      "width": 40,
+      "height": 30,
+      "diameter": 0.0,
+      "inner_diameter": 0.0,
+      "corner_radius": 0.0,
+      "points": [],
+      "holes": [],
+      "rotate_allowed": true,
+      "rotation_step": 45
+    }
+  ],
+  "placements": [
+    {
+      "part_index": 0,
+      "x": 0.0,
+      "y": 0.0,
+      "angle": 0
+    },
+    {
+      "part_index": 1,
+      "x": 35.0,
+      "y": 40.0,
+      "angle": 0
+    }
+  ]
+}
