@@ -60,3 +60,54 @@ def fillet_corner(points: list[tuple[float,float]], index: int,
     if not Polygon(new).is_valid:
         raise ValueError('Скругление вызвало пересечение соседних элементов')
     return new
+
+
+def set_edge_length(points: list[tuple[float, float]], edge_start: int,
+                    new_length: float) -> list[tuple[float, float]]:
+    """Resize one edge in mm, keeping its first vertex and direction fixed.
+
+    Only the second endpoint moves. Geometry validity of the entire gasket,
+    including holes, must be checked by the caller before applying the change.
+    """
+    from math import isfinite
+
+    if len(points) < 3 or not 0 <= edge_start < len(points):
+        raise ValueError('Выберите ребро замкнутого контура')
+    if not isfinite(new_length) or new_length <= 0:
+        raise ValueError('Длина ребра должна быть положительной и конечной')
+    a = points[edge_start]
+    end_idx = (edge_start + 1) % len(points)
+    b = points[end_idx]
+    old_length = hypot(b[0] - a[0], b[1] - a[1])
+    if old_length <= 1e-9:
+        raise ValueError('У выбранного ребра нулевая длина')
+    updated = list(points)
+    updated[end_idx] = (
+        round(a[0] + (b[0] - a[0]) * new_length / old_length, 5),
+        round(a[1] + (b[1] - a[1]) * new_length / old_length, 5),
+    )
+    return updated
+
+
+def rectangular_hole(center: tuple[float, float], width: float,
+                     height: float) -> list[tuple[float, float]]:
+    """Four-point closed rectangle, centered at a selected drawing location."""
+    from math import isfinite
+    if not all(isfinite(v) for v in (*center, width, height)) or min(width, height) <= 0:
+        raise ValueError('Центр и размеры отверстия должны быть корректными')
+    x, y = center
+    w, h = width / 2, height / 2
+    return [(x-w, y-h), (x+w, y-h), (x+w, y+h), (x-w, y+h)]
+
+
+def circular_hole(center: tuple[float, float], diameter: float,
+                  segments: int = 96) -> list[tuple[float, float]]:
+    """Approximate a circular hole by a regular polygon in millimetres."""
+    from math import isfinite
+    if (not all(isfinite(v) for v in (*center, diameter)) or diameter <= 0
+            or not 24 <= segments <= 512):
+        raise ValueError('Некорректный диаметр, центр или точность окружности')
+    cx, cy = center
+    radius = diameter / 2
+    return [(cx + radius*cos(2*pi*i/segments),
+             cy + radius*sin(2*pi*i/segments)) for i in range(segments)]
