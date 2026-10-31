@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
-from PyQt6.QtCore import QPointF, Qt, QTimer
+from PyQt6.QtCore import QPointF, Qt, QTimer, QSettings, QByteArray
 from PyQt6.QtGui import QColor, QBrush, QPen, QPainter, QPainterPath, QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -329,6 +329,7 @@ class OrderSheetDialog(QDialog):
         self._loading_scene = False
         self._build_ui()
         self._refresh_table()
+        QTimer.singleShot(0, self._restore_panel_state)
 
     def _build_ui(self):
         top = QVBoxLayout(self)
@@ -341,15 +342,22 @@ class OrderSheetDialog(QDialog):
         top.addWidget(intro)
         split = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(split, stretch=1)
-        # Input controls may be taller than the monitor (especially with
-        # Windows text scaling). Scroll them independently of the drawing.
+        self.main_splitter = split
+        # Keep the calculation and variant controls accessible at all times.
+        # Only the settings, quick-entry form and part list scroll.
+        self.left_column = QWidget()
+        left_column_layout = QVBoxLayout(self.left_column)
+        left_column_layout.setContentsMargins(0, 0, 0, 0)
+        left_column_layout.setSpacing(6)
+        split.addWidget(self.left_column)
         self.left_scroll = QScrollArea()
         self.left_scroll.setObjectName("orderInputScroll")
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.left_scroll.setMinimumWidth(365)
-        self.left_scroll.setMaximumWidth(570)
+        self.left_column.setMinimumWidth(340)
+        self.left_column.setMaximumWidth(590)
+        self.left_scroll.setMinimumWidth(335)
         self.left_scroll.setMinimumHeight(200)
         left = QWidget()
         left.setObjectName("orderInputContent")
@@ -357,17 +365,25 @@ class OrderSheetDialog(QDialog):
         l.setContentsMargins(5, 5, 9, 5)
         l.setSpacing(8)
         self.left_scroll.setWidget(left)
-        split.addWidget(self.left_scroll)
-        settings = QGroupBox("Заказываемый материал")
-        f = QFormLayout(settings)
+        left_column_layout.addWidget(self.left_scroll, stretch=1)
+        settings = QGroupBox("Заказываемый лист")
+        f = QGridLayout(settings)
+        f.setHorizontalSpacing(8)
+        f.setVerticalSpacing(5)
         self.sheet_width = _spin(1000, 1)
         self.gap = _spin(5)
         self.margin = _spin(5)
         self.step = _spin(10, 0.01)
-        f.addRow("Ширина листа:", self.sheet_width)
-        f.addRow("Зазор между деталями:", self.gap)
-        f.addRow("Отступ от кромки:", self.margin)
-        f.addRow("Кратность длины заказа:", self.step)
+        for row, column, label, control in (
+            (0, 0, "Ширина:", self.sheet_width),
+            (0, 2, "Зазор:", self.gap),
+            (1, 0, "Кромка:", self.margin),
+            (1, 2, "Шаг заказа:", self.step),
+        ):
+            f.addWidget(QLabel(label), row, column)
+            f.addWidget(control, row, column + 1)
+        self.sheet_width.setToolTip("Фиксированная ширина. Длина будет найдена автоматически.")
+        self.step.setToolTip("Длина заказа округляется вверх до этого шага (например, 10 мм).")
         l.addWidget(settings)
         # Редко используемые реквизиты заказа скрыты, чтобы не замедлять
         # быстрый ввод простых форм: достаточно ширины, зазора и размеров.
@@ -447,9 +463,11 @@ class OrderSheetDialog(QDialog):
         mode.addWidget(self.quality,stretch=1)
         l.addLayout(mode)
         self.calculate_button = QPushButton("📐 Подобрать длину листа автоматически")
-        self.calculate_button.setMinimumHeight(44)
+        self.calculate_button.setObjectName("orderCalculateButton")
+        self.calculate_button.setMinimumHeight(42)
+        self.calculate_button.setToolTip("Кнопка доступна при любой прокрутке параметров слева.")
         self.calculate_button.clicked.connect(self.calculate)
-        l.addWidget(self.calculate_button)
+        left_column_layout.addWidget(self.calculate_button)
         variant_row = QHBoxLayout()
         variant_row.addWidget(QLabel("Вариант раскроя:"))
         self.variant_combo = QComboBox()
@@ -458,22 +476,27 @@ class OrderSheetDialog(QDialog):
             "Сравните варианты по длине и отходам; выбор меняет чертёж и спецификацию.")
         self.variant_combo.currentIndexChanged.connect(self._select_variant)
         variant_row.addWidget(self.variant_combo, stretch=1)
-        l.addLayout(variant_row)
+        left_column_layout.addLayout(variant_row)
         self.compare_button = QPushButton("▦ Сравнить схемы рядом")
         self.compare_button.setEnabled(False)
         self.compare_button.clicked.connect(self.compare_variants)
-        l.addWidget(self.compare_button)
+        left_column_layout.addWidget(self.compare_button)
         # Results are deliberately outside the left input scroller.
         # They remain visible while the operator edits a long parts list.
         r = QWidget()
         split.addWidget(r)
         right = QVBoxLayout(r)
+        # Operator can allocate more space to either the drawing or the text.
+        self.result_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.result_splitter.setObjectName("orderResultSplitter")
+        self.result_splitter.setChildrenCollapsible(False)
+        right.addWidget(self.result_splitter, stretch=1)
         self.scene = QGraphicsScene(self)
         self.view = SheetView(self.scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.view.setBackgroundBrush(QColor("#e6e8eb"))
         self.view.setMinimumSize(300, 190)
-        right.addWidget(self.view, stretch=1)
+        self.result_splitter.addWidget(self.view)
 
         results_box = QGroupBox("Результат расчёта и рекомендуемая длина листа")
         results_layout = QVBoxLayout(results_box)
@@ -484,7 +507,6 @@ class OrderSheetDialog(QDialog):
         self.summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.summary_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.summary_scroll.setMinimumHeight(108)
-        self.summary_scroll.setMaximumHeight(185)
         self.summary = QLabel(
             "Укажите ширину и количество деталей. Длина вычисляется автоматически. "
             "Все размеры — в мм.")
@@ -495,20 +517,26 @@ class OrderSheetDialog(QDialog):
         self.summary.setContentsMargins(8, 6, 8, 6)
         self.summary_scroll.setWidget(self.summary)
         results_layout.addWidget(self.summary_scroll)
-        right.addWidget(results_box)
+        self.result_splitter.addWidget(results_box)
+        self.result_splitter.setSizes([520, 170])
         hint = QLabel("Колёсико — масштаб • ЛКМ по детали — перемещение • Ctrl+S — сохранение проекта. "+
                       "Красивый чертёж не заменяет технологическую проверку реза.")
         hint.setWordWrap(True)
         right.addWidget(hint)
-        buttons = QHBoxLayout()
-        for text, slot in (("Сохранить проект JSON", self.save_project),
-                           ("Открыть JSON", self.load_project),
-                           ("Экспорт схемы SVG", self.export_svg),
-                           ("Спецификация TXT", self.export_report),
-                           ("Вписать лист", self.fit_view)):
+        # Two compact rows avoid clipped action buttons on narrow screens.
+        buttons = QGridLayout()
+        buttons.setHorizontalSpacing(6)
+        buttons.setVerticalSpacing(4)
+        for i, (text, slot) in enumerate((
+            ("Сохранить JSON", self.save_project),
+            ("Открыть JSON", self.load_project),
+            ("Экспорт SVG", self.export_svg),
+            ("Спецификация TXT", self.export_report),
+            ("Вписать лист", self.fit_view),
+        )):
             b = QPushButton(text)
             b.clicked.connect(slot)
-            buttons.addWidget(b)
+            buttons.addWidget(b, i // 3, i % 3)
         right.addLayout(buttons)
         split.setChildrenCollapsible(False)
         split.setSizes([475, 825])
@@ -531,14 +559,17 @@ class OrderSheetDialog(QDialog):
             ("▼" if visible else "▶") + " Технология резки и направление материала")
 
     def _build_quick_entry(self, layout: QVBoxLayout):
-        """Постоянно видимая форма быстрого ввода типовых деталей."""
+        """Compact, one-click standard shape entry, without opening a dialog."""
         group = QGroupBox("Быстро добавить типовую деталь")
-        form = QFormLayout(group)
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(5)
+        self.quick_grid = grid
         self.quick_kind = QComboBox()
         for kind in STANDARD_KINDS:
             self.quick_kind.addItem(SHAPE_NAMES[kind], kind)
         self.quick_name = QLineEdit()
-        self.quick_name.setPlaceholderText("Пустое = название по размеру")
+        self.quick_name.setPlaceholderText("Название (необязательно)")
         self.quick_qty = QSpinBox()
         self.quick_qty.setRange(1, 300)
         self.quick_qty.setValue(1)
@@ -547,24 +578,35 @@ class OrderSheetDialog(QDialog):
         self.quick_diameter = _spin(100, 0.01)
         self.quick_inner = _spin(40, 0.01)
         self.quick_radius = _spin(10, 0)
-        self.quick_rotation = QCheckBox("Разрешить поворот детали")
+        self.quick_rotation = QCheckBox("Поворот разрешён")
         self.quick_rotation.setChecked(True)
-        self.quick_grain = QCheckBox("Соблюдать ось X детали по направлению материала")
-        for label, field in (
-            ("Форма:", self.quick_kind), ("Название:", self.quick_name),
-            ("Количество:", self.quick_qty), ("Ширина:", self.quick_width),
-            ("Высота:", self.quick_height), ("Диаметр:", self.quick_diameter),
-            ("Внутренний Ø:", self.quick_inner), ("Радиус R:", self.quick_radius),
+        self.quick_grain = QCheckBox("Учитывать направление материала")
+        self.quick_grain.setToolTip("Ось X детали ориентирована вдоль прокатки/волокон.")
+        grid.addWidget(QLabel("Форма:"), 0, 0)
+        grid.addWidget(self.quick_kind, 0, 1)
+        grid.addWidget(QLabel("Штук:"), 0, 2)
+        grid.addWidget(self.quick_qty, 0, 3)
+        grid.addWidget(self.quick_name, 1, 0, 1, 4)
+        self._quick_dimension_widgets = {}
+        for label, control, row, column in (
+            ("Ширина:", self.quick_width, 2, 0),
+            ("Высота:", self.quick_height, 2, 2),
+            ("Диаметр:", self.quick_diameter, 2, 0),
+            ("Внутр. Ø:", self.quick_inner, 2, 2),
+            ("Радиус R:", self.quick_radius, 3, 0),
         ):
-            form.addRow(label, field)
-        form.addRow("", self.quick_rotation)
-        form.addRow("", self.quick_grain)
+            caption = QLabel(label)
+            self._quick_dimension_widgets[control] = caption
+            grid.addWidget(caption, row, column)
+            grid.addWidget(control, row, column + 1)
+        grid.addWidget(self.quick_rotation, 4, 0, 1, 2)
+        grid.addWidget(self.quick_grain, 4, 2, 1, 2)
         self.quick_submit = QPushButton("＋ Добавить в список")
-        form.addRow(self.quick_submit)
+        self.quick_submit.setMinimumHeight(34)
+        grid.addWidget(self.quick_submit, 5, 0, 1, 4)
         self.quick_submit.clicked.connect(self.add_quick_part)
         self.quick_name.returnPressed.connect(self.add_quick_part)
         self.quick_kind.currentIndexChanged.connect(self._update_quick_fields)
-        self._quick_form = form
         self._update_quick_fields()
         layout.addWidget(group)
 
@@ -579,9 +621,28 @@ class OrderSheetDialog(QDialog):
         }
         for field, show in visible.items():
             field.setVisible(show)
-            label = self._quick_form.labelForField(field)
-            if label is not None:
-                label.setVisible(show)
+            self._quick_dimension_widgets[field].setVisible(show)
+
+    def _restore_panel_state(self):
+        """Restore sizes without restoring window position across monitors."""
+        settings = QSettings("GasketCalculator", "OrderSheet")
+        for key, splitter in (("input_splitter", self.main_splitter),
+                              ("result_splitter", self.result_splitter)):
+            state = settings.value(key)
+            if isinstance(state, QByteArray) and not state.isEmpty():
+                splitter.restoreState(state)
+        for key, toggle in (("material_open", self.material_details_toggle),
+                            ("technology_open", self.technology_toggle)):
+            toggle.setChecked(str(settings.value(key, "false")).lower() == "true")
+
+    def closeEvent(self, event):
+        """Keep operator-adjusted panel proportions for the next launch."""
+        settings = QSettings("GasketCalculator", "OrderSheet")
+        settings.setValue("input_splitter", self.main_splitter.saveState())
+        settings.setValue("result_splitter", self.result_splitter.saveState())
+        settings.setValue("material_open", self.material_details_toggle.isChecked())
+        settings.setValue("technology_open", self.technology_toggle.isChecked())
+        super().closeEvent(event)
 
     def add_quick_part(self):
         """Ввод типовой детали без открытия диалогов; одинаковые строки объединяются."""
