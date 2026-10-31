@@ -6,19 +6,20 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from math import cos, sin, pi, hypot
+from math import hypot
 
-from PyQt6.QtCore import Qt, QPointF, QRectF, QTimer
+from PyQt6.QtCore import Qt, QPointF, QTimer
 from PyQt6.QtGui import QColor, QBrush, QPainter, QPen, QPainterPath
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QGraphicsEllipseItem, QGraphicsItem, QGraphicsPathItem,
     QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout,
-    QLabel, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QLabel, QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from algorithms.nesting import Part
-from algorithms.contour_ops import fillet_corner
+from algorithms.contour_ops import (fillet_corner, set_edge_length,
+                                    rectangular_hole, circular_hole)
 
 MAX_HANDLES = 350
 
@@ -73,7 +74,8 @@ class VertexHandle(QGraphicsEllipseItem):
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         if self.editor.ready:
-            QTimer.singleShot(0, self.editor._draw_all)
+            # An invalid drag must not silently remain in the editable geometry.
+            QTimer.singleShot(0, self.editor._finish_vertex_drag)
 
     def itemChange(self,change,value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self.editor.ready:
@@ -90,8 +92,20 @@ class VertexHandle(QGraphicsEllipseItem):
 
 
 class ContourView(QGraphicsView):
+    def mousePressEvent(self, event):
+        editor = self.scene().editor
+        if editor.placement_kind is not None and event.button() == Qt.MouseButton.LeftButton:
+            at = self.mapToScene(event.pos())
+            editor._add_hole(editor.placement_kind == "circle", (at.x(), at.y()))
+            editor._set_placement_mode(None)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def mouseDoubleClickEvent(self,event):
-        self.scene().editor._double_click(event)
+        if self.scene().editor.placement_kind is None:
+            self.scene().editor._double_click(event)
+        event.accept()
 
     def wheelEvent(self,event):
         factor=1.12 if event.angleDelta().y()>0 else 1/1.12
@@ -106,6 +120,7 @@ class ContourEditor(QDialog):
         self.rings=[deepcopy(points),*deepcopy(holes or [])]
         if not self.rings[0]: self.rings[0]=[(0,0),(150,0),(150,100),(0,100)]
         self.undo_stack=[]
+        self.placement_kind=None
         self.ready=False
         self.handles=[]
         self.annotations=[]
@@ -118,15 +133,24 @@ class ContourEditor(QDialog):
         root=QVBoxLayout(self)
         helptext=QLabel('Синие точки — внешний контур, оранжевые — отверстия. Перетащите вершину либо введите координаты справа. '
                         'Двойной клик по фигуре добавляет вершину в ближайшее ребро выбранного контура. '
-                        'Все размеры — мм; размерные линии справочные.')
+                        'Для точной длины ребра выберите его начальную вершину. '
+                        'Отверстие можно поставить нажатием на чертёж. Все размеры — мм.')
         helptext.setWordWrap(True);root.addWidget(helptext)
         body=QHBoxLayout();root.addLayout(body,stretch=1)
         self.scene=GridScene(self)
         self.view=ContourView(self.scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.view.setMinimumWidth(600)
+        self.view.setMinimumWidth(320)
         body.addWidget(self.view,stretch=1)
-        side=QVBoxLayout();body.addLayout(side)
+        self.side_scroll=QScrollArea()
+        self.side_scroll.setWidgetResizable(True)
+        self.side_scroll.setMinimumWidth(280)
+        self.side_scroll.setMaximumWidth(375)
+        side_widget=QWidget()
+        side=QVBoxLayout(side_widget)
+        side.setContentsMargins(6, 4, 6, 4)
+        self.side_scroll.setWidget(side_widget)
+        body.addWidget(self.side_scroll)
         form=QFormLayout()
         self.active_ring=QComboBox();self.active_ring.currentIndexChanged.connect(self._sync_fields)
         self.active_vertex=QSpinBox();self.active_vertex.setRange(1,50000);self.active_vertex.valueChanged.connect(self._sync_coords)
@@ -134,16 +158,34 @@ class ContourEditor(QDialog):
         form.addRow('Контур:',self.active_ring)
         form.addRow('Вершина №:',self.active_vertex)
         form.addRow('X:',self.x);form.addRow('Y:',self.y)
+        self.edge_length=_qspin(0,0.01,1_000_000)
+        self.edge_length.setToolTip('Длина ребра от выбранной вершины до следующей. Начало ребра неподвижно.')
+        form.addRow('Длина следующего ребра:',self.edge_length)
         side.addLayout(form)
         move=QPushButton('Применить координаты')
         move.clicked.connect(self.apply_coordinates);side.addWidget(move)
+        resize_edge=QPushButton('Изменить длину выбранного ребра')
+        resize_edge.clicked.connect(self.apply_edge_length)
+        side.addWidget(resize_edge)
         row=QHBoxLayout();side.addLayout(row)
         for label,slot in (('＋ Вершина',self.add_vertex),('− Вершина',self.remove_vertex)):
             b=QPushButton(label);b.clicked.connect(slot);row.addWidget(b)
         for label,slot in (('Скруглить выбранный угол (R)',self.fillet_selected),
-                           ('＋ Прямоугольное отверстие',self.add_rect_hole),
-                           ('＋ Круглое отверстие',self.add_round_hole),
-                           ('Удалить отверстие',self.delete_hole),('↶ Отменить изменение',self.undo)):
+                           ('＋ Прямоугольное отверстие (размеры)',self.add_rect_hole),
+                           ('＋ Круглое отверстие (размеры)',self.add_round_hole)):
+            b=QPushButton(label);b.clicked.connect(slot);side.addWidget(b)
+        self.place_rect_button=QPushButton('Указать центр прямоугольного отверстия')
+        self.place_round_button=QPushButton('Указать центр круглого отверстия')
+        for b, kind in ((self.place_rect_button,'rectangle'),
+                        (self.place_round_button,'circle')):
+            b.setCheckable(True)
+            b.clicked.connect(lambda checked, k=kind: self._set_placement_mode(k if checked else None))
+            side.addWidget(b)
+        self.place_info=QLabel('Щелчок на чертеже задаст центр отверстия.')
+        self.place_info.setWordWrap(True)
+        side.addWidget(self.place_info)
+        for label,slot in (('Удалить отверстие',self.delete_hole),
+                           ('↶ Отменить изменение',self.undo)):
             b=QPushButton(label);b.clicked.connect(slot);side.addWidget(b)
         self.snap=QCheckBox('Привязка к сетке');self.snap.setChecked(False)
         self.snap.toggled.connect(lambda _:self.scene.update())
