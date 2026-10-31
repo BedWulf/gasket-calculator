@@ -230,17 +230,20 @@ class ContourEditor(QDialog):
                     self.scene.addItem(h);self.handles.append(h)
         self._annotations()
         selected_ring=self.active_ring.currentIndex()
+        selected_vertex=self.active_vertex.value()
         self.active_ring.blockSignals(True);self.active_ring.clear()
         for idx in range(len(self.rings)):
             self.active_ring.addItem('Внешний контур' if idx==0 else f'Отверстие {idx}',idx)
         self.active_ring.setCurrentIndex(max(0,min(selected_ring,len(self.rings)-1)))
         self.active_ring.blockSignals(False)
         self._sync_fields()
+        self.active_vertex.setValue(min(selected_vertex, self.active_vertex.maximum()))
         self.ready=True
         if fit:self.fit()
         try:
             p=self._polygon_check()
-            self.info.setText(f'Габариты: {p.geometry().bounds[2]:.2f} × {p.geometry().bounds[3]:.2f} мм\n'
+            minx, miny, maxx, maxy = p.geometry().bounds
+            self.info.setText(f'Габариты: {maxx-minx:.2f} × {maxy-miny:.2f} мм\n'
                               f'Площадь: {p.actual_area():.2f} мм²\n'
                               + ('Слишком много вершин для перетаскивания — используйте точные координаты.' if count>MAX_HANDLES else 'Контур корректен.'))
         except ValueError as exc:self.info.setText('⚠ Контур требует исправления: '+str(exc))
@@ -284,6 +287,10 @@ class ContourEditor(QDialog):
         idx=self.active_ring.currentIndex();vertex=self.active_vertex.value()-1
         if idx<0 or vertex>=len(self.rings[idx]):return
         self.x.setValue(self.rings[idx][vertex][0]);self.y.setValue(self.rings[idx][vertex][1])
+        ring=self.rings[idx]
+        next_pt=ring[(vertex+1)%len(ring)]
+        point=ring[vertex]
+        self.edge_length.setValue(hypot(next_pt[0]-point[0], next_pt[1]-point[1]))
 
     def vertex_selected(self,ring_idx,vertex_idx):
         self.active_ring.setCurrentIndex(ring_idx)
@@ -300,11 +307,42 @@ class ContourEditor(QDialog):
             path.closeSubpath()
         self.path_item.setPath(path)
 
+    def _apply_candidate(self, candidate, error_title='Некорректная геометрия'):
+        try:
+            Part('Деталь','polygon',points=candidate[0],holes=candidate[1:]).check()
+        except ValueError as exc:
+            QMessageBox.warning(self,error_title,str(exc))
+            return False
+        self._snapshot()
+        self.rings=candidate
+        self._draw_all()
+        return True
+
     def apply_coordinates(self):
         ring_id=self.active_ring.currentIndex();vertex=self.active_vertex.value()-1
         if ring_id<0:return
-        self._snapshot()
-        self.rings[ring_id][vertex]=(self.x.value(),self.y.value())
+        candidate=deepcopy(self.rings)
+        candidate[ring_id][vertex]=(self.x.value(),self.y.value())
+        self._apply_candidate(candidate)
+
+    def apply_edge_length(self):
+        ring_id=self.active_ring.currentIndex();vertex=self.active_vertex.value()-1
+        if ring_id<0:return
+        try:
+            candidate=deepcopy(self.rings)
+            candidate[ring_id]=set_edge_length(candidate[ring_id],vertex,self.edge_length.value())
+        except ValueError as exc:
+            QMessageBox.warning(self,'Длина ребра',str(exc))
+            return
+        self._apply_candidate(candidate,'Длина ребра')
+
+    def _finish_vertex_drag(self):
+        try:
+            self._polygon_check()
+        except ValueError as exc:
+            if self.undo_stack:
+                self.rings=self.undo_stack.pop()
+            QMessageBox.warning(self,'Перемещение отменено',str(exc))
         self._draw_all()
 
     def add_vertex(self):
