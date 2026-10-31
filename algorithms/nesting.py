@@ -115,6 +115,11 @@ class NestResult:
     margin: float
     length_step: float
     parts: list[Part]
+    # Поля заказа необязательны: старые проекты (schema_version=1) открываются
+    # с пустыми значениями. Масса рассчитывается только при наличии обоих.
+    material_name: str = ""
+    thickness_mm: float = 0.0
+    density_g_cm3: float = 0.0
 
     @property
     def material_area(self) -> float:
@@ -134,12 +139,56 @@ class NestResult:
 
     @property
     def area_lower_bound(self) -> float:
-        """Нижняя граница длины только по площади (без раскроя и зазоров)."""
-        return sum(p.quantity * p.actual_area() for p in self.parts) / max(self.sheet_width - 2*self.margin, 1e-9)
+        """Оптимистичная нижняя граница ДЛИНЫ листа, включая отступы.
+
+        Площади контуров (вырезы исключены) должны поместиться внутри
+        прямоугольника полезной ширины. Междетальные зазоры здесь намеренно
+        не учитываются: это математически допустимая, но слабая граница.
+        """
+        usable_width = self.sheet_width - 2 * self.margin
+        return 2 * self.margin + self.material_area / usable_width
+
+    @property
+    def order_length_lower_bound(self) -> float:
+        """Гарантированная нижняя граница длины с кратностью заказа.
+
+        Помимо площади учитываем минимальную габаритную высоту каждой
+        детали с разрешёнными ориентациями, которые помещаются по ширине.
+        Это НЕ найденная раскладка и не доказательство её достижимости.
+        """
+        min_per_part = []
+        for part in self.parts:
+            valid_heights = [g.bounds[3] for a in allowed_angles(part, thorough=True)
+                             for g in [oriented_geometry(part, a)]
+                             if g.bounds[2] <= self.sheet_width - 2*self.margin + 1e-8]
+            if not valid_heights:
+                raise ValueError(f"Деталь «{part.name}» не проходит по ширине листа")
+            min_per_part.append(min(valid_heights))
+        return _round_up(max(self.area_lower_bound,
+                             max(min_per_part) + 2*self.margin), self.length_step)
+
+    @property
+    def purchased_mass_kg(self) -> float | None:
+        """Масса заказного листа в кг, если заданы толщина и плотность.
+
+        мм² * мм / 1000 (мм³/см³) * г/см³ / 1000 (г/кг).
+        """
+        if self.thickness_mm <= 0 or self.density_g_cm3 <= 0:
+            return None
+        return self.sheet_area * self.thickness_mm * self.density_g_cm3 / 1_000_000
+
+    @property
+    def parts_mass_kg(self) -> float | None:
+        if self.purchased_mass_kg is None:
+            return None
+        return self.material_area * self.thickness_mm * self.density_g_cm3 / 1_000_000
 
     def to_dict(self) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
+            "material_name": self.material_name,
+            "thickness_mm": self.thickness_mm,
+            "density_g_cm3": self.density_g_cm3,
             "sheet_width": self.sheet_width,
             "sheet_length": self.sheet_length,
             "gap": self.gap, "margin": self.margin, "length_step": self.length_step,
@@ -176,13 +225,29 @@ def allowed_angles(part: Part, *, thorough: bool = False) -> tuple[int, ...]:
 
 def validate_result(result: NestResult) -> bool:
     """Полная проверка с учётом отверстий, отступа и междетального зазора."""
-    if result.sheet_width <= 0 or result.sheet_length <= 0 or result.gap < 0 or result.margin < 0:
+    if not all(isfinite(v) for v in (result.sheet_width, result.sheet_length,
+                        result.gap, result.margin, result.length_step,
+                        result.thickness_mm, result.density_g_cm3)):
+        return False
+    if (result.sheet_width <= 0 or result.sheet_length <= 0 or
+            result.length_step <= 0 or result.gap < 0 or result.margin < 0 or
+            result.thickness_mm < 0 or result.density_g_cm3 < 0 or
+            result.sheet_width <= 2*result.margin or result.sheet_length <= 2*result.margin):
+        return False
+    if abs(result.sheet_length / result.length_step - round(result.sheet_length / result.length_step)) > 1e-5:
+        return False
+    if not result.parts or sum(p.quantity for p in result.parts) > 300:
+        return False
+    try:
+        for part in result.parts:
+            part.check()
+    except (ValueError, TypeError):
         return False
     shapes: list[BaseGeometry] = []
     counts = [0] * len(result.parts)
     epsilon = 1e-6
     for p in result.placements:
-        if p.part_index < 0 or p.part_index >= len(result.parts):
+        if type(p.part_index) is not int or p.part_index < 0 or p.part_index >= len(result.parts):
             return False
         if not (isfinite(p.x) and isfinite(p.y)):
             return False

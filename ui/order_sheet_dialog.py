@@ -24,6 +24,8 @@ from shapely.affinity import translate
 
 from algorithms.part_catalog import standard_part, add_to_order, STANDARD_KINDS
 from algorithms.export_svg import build_svg, COLORS
+from algorithms.order_report import build_order_report
+from algorithms.project_io import result_from_dict
 from algorithms.import_cad import import_svg, import_dxf
 from ui.contour_editor import ContourEditor
 from algorithms.nesting import (
@@ -276,6 +278,29 @@ class OrderSheetDialog(QDialog):
         f.addRow("Отступ от кромки:", self.margin)
         f.addRow("Кратность длины заказа:", self.step)
         l.addWidget(settings)
+        # Редко используемые реквизиты заказа скрыты, чтобы не замедлять
+        # быстрый ввод простых форм: достаточно ширины, зазора и размеров.
+        self.material_details_toggle = QPushButton("▶ Материал и масса (необязательно)")
+        self.material_details_toggle.setCheckable(True)
+        l.addWidget(self.material_details_toggle)
+        self.material_details = QWidget()
+        extra = QFormLayout(self.material_details)
+        self.material_name = QLineEdit()
+        self.material_name.setPlaceholderText("Например, паронит ПОН-Б")
+        self.thickness = _spin(0, 0, 1000, 2)
+        self.density = QDoubleSpinBox()
+        self.density.setRange(0, 50)
+        self.density.setDecimals(3)
+        self.density.setSingleStep(0.1)
+        self.density.setSuffix(" г/см³")
+        self.density.setSpecialValueText("Не задана")
+        self.thickness.setSpecialValueText("Не задана")
+        extra.addRow("Марка материала:", self.material_name)
+        extra.addRow("Толщина (для массы):", self.thickness)
+        extra.addRow("Плотность (для массы):", self.density)
+        self.material_details.setVisible(False)
+        self.material_details_toggle.toggled.connect(self._toggle_material_details)
+        l.addWidget(self.material_details)
         self._build_quick_entry(l)
         l.addWidget(QLabel("Список деталей — раскрой одним листом"))
         self.table = QTableWidget(0, 3)
@@ -334,6 +359,7 @@ class OrderSheetDialog(QDialog):
         for text, slot in (("Сохранить проект JSON", self.save_project),
                            ("Открыть JSON", self.load_project),
                            ("Экспорт схемы SVG", self.export_svg),
+                           ("Спецификация TXT", self.export_report),
                            ("Вписать лист", self.fit_view)):
             b = QPushButton(text)
             b.clicked.connect(slot)
@@ -341,9 +367,16 @@ class OrderSheetDialog(QDialog):
         right.addLayout(buttons)
         split.setSizes([490, 850])
         # После изменения входных параметров прежний раскрой неактуален.
-        for spin in (self.sheet_width, self.gap, self.margin, self.step):
+        for spin in (self.sheet_width, self.gap, self.margin, self.step,
+                     self.thickness, self.density):
             spin.valueChanged.connect(self._reset_layout)
+        self.material_name.textChanged.connect(self._reset_layout)
         self.quality.currentIndexChanged.connect(self._reset_layout)
+
+    def _toggle_material_details(self, visible: bool):
+        self.material_details.setVisible(visible)
+        self.material_details_toggle.setText(
+            ("▼" if visible else "▶") + " Материал и масса (необязательно)")
 
     def _build_quick_entry(self, layout: QVBoxLayout):
         """Постоянно видимая форма быстрого ввода типовых деталей."""
@@ -520,6 +553,9 @@ class OrderSheetDialog(QDialog):
             self.result = calculate_sheet(self.parts, self.sheet_width.value(),
                                           self.gap.value(), self.margin.value(), self.step.value(),
                                           quality=self.quality.currentData())
+            self.result.material_name = self.material_name.text().strip()
+            self.result.thickness_mm = self.thickness.value()
+            self.result.density_g_cm3 = self.density.value()
         except (ValueError, RuntimeError) as e:
             QMessageBox.warning(self, "Не удалось рассчитать", str(e))
             return
@@ -570,7 +606,10 @@ class OrderSheetDialog(QDialog):
             f"Площадь листа: {r.sheet_area/1e6:.4f} м²<br>"
             f"Использование материала: {r.utilization:.1f}%<br>"
             f"Отходы (включая зазоры): {r.waste_area/1e6:.4f} м²<br>"
-            f"Только площадная нижняя граница: {r.area_lower_bound:.1f} мм.<br>"
+            f"Теоретическая нижняя граница длины: {r.order_length_lower_bound:g} мм.<br>"
+            + (f"Масса листа: {r.purchased_mass_kg:.3f} кг; "
+               f"масса деталей: {r.parts_mass_kg:.3f} кг.<br>"
+               if r.purchased_mass_kg is not None else "") +
             "<i>Длина получена эвристически. Перед заказом проверьте технологические допуски."+
             (" Тщательный поиск ограничен 55 деталями." if self.quality.currentData() == "thorough" and len(r.placements)>55 else "")+
             "</i>")
@@ -617,24 +656,19 @@ class OrderSheetDialog(QDialog):
             return
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            if payload.get("schema_version") != 1:
-                raise ValueError("Неизвестная версия файла проекта")
-            parts = [Part(**entry) for entry in payload["parts"]]
-            for p in parts:
-                p.check()
-            result = NestResult(
-                float(payload["sheet_width"]), float(payload["sheet_length"]),
-                [Placement(**entry) for entry in payload["placements"]],
-                float(payload["gap"]), float(payload["margin"]),
-                float(payload["length_step"]), parts)
-            if not validate_result(result):
-                raise ValueError("В сохранённом файле обнаружена некорректная раскладка")
+            result = result_from_dict(payload)
+            parts = result.parts
             # Сигналы изменения параметров сбрасывают старый чертёж,
             # поэтому сохранённый result устанавливаем только после параметров.
             self.sheet_width.setValue(result.sheet_width)
             self.gap.setValue(result.gap)
             self.margin.setValue(result.margin)
             self.step.setValue(result.length_step)
+            self.material_name.setText(result.material_name)
+            self.thickness.setValue(result.thickness_mm)
+            self.density.setValue(result.density_g_cm3)
+            self.material_details_toggle.setChecked(bool(result.material_name or
+                result.thickness_mm or result.density_g_cm3))
             self.parts = parts
             self.result = result
             self._refresh_table()
@@ -653,3 +687,17 @@ class OrderSheetDialog(QDialog):
             Path(path).write_text(build_svg(self.result), encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self,"Ошибка экспорта",str(exc))
+
+    def export_report(self):
+        """Спецификация закупки; не заменяет утверждённую технологическую карту."""
+        if self.result is None:
+            QMessageBox.information(self, "Спецификация", "Сначала рассчитайте лист")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Спецификация заказного листа",
+                                               "заказ_листа.txt", "Текст UTF-8 (*.txt)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(build_order_report(self.result), encoding="utf-8-sig")
+        except (ValueError, OSError) as exc:
+            QMessageBox.critical(self, "Ошибка экспорта спецификации", str(exc))
